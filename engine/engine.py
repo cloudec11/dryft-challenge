@@ -559,19 +559,26 @@ class Engine:
         batch 32 over 2048 tokens it is ~9.8 GB per step against 8.05 GB of
         weights -- so this is worth measuring rather than predicting. The
         tiling does not change what the kernel computes, but the winner is
-        checked against the FP32 reference anyway."""
+        checked against the FP32 reference anyway.
+
+        One call per layer, over that layer's own cache: a single layer's KV
+        can sit in L2 (42 MB at batch 16 over 640 slots), so replaying one
+        call would measure an L2-resident read and pick a tile for a regime
+        the real step never sees -- exactly the mistake that made v5 slower
+        than v4. In the step every layer's KV is cold."""
         batch, cap = st.batch, st.capacity
         layer = self.layers[0]
         q = self._randn(batch, self.nq * self.head_dim, scale=2.0)
         qkv = self._randn(batch, layer.qkv.shape[0], scale=2.0)
         kc, vc = st.k_cache[0], st.v_cache[0]
-        # Attention over a zeroed cache is a uniform softmax; give the timing
-        # and the check real values. Prefill overwrites these slots.
+        # Attention over a zeroed cache is a uniform softmax; layer 0 gets
+        # real values so the correctness check below means something. The
+        # other layers stay zero: reading them costs the same bandwidth.
         kc.normal_(0.0, 2.0)
         vc.normal_(0.0, 1.0)
         pos = torch.tensor([cap - 1], dtype=torch.int32, device=self.device)
         use_fused = self.fused_ok and batch <= FUSED_MAX_BATCH
-        reps = 4
+        reps = self.n_layers
         timings = []
         for cand in ops.ATTN_CANDIDATES:
             block_n, target, warps, stages = cand
@@ -583,12 +590,13 @@ class Engine:
                 )
 
                 def run():
-                    for _ in range(reps):
+                    for i in range(reps):
+                        ki, vi = st.k_cache[i], st.v_cache[i]
                         if use_fused:
                             fused.attention_fused(attn, qkv, layer.q_norm, layer.k_norm,
-                                                  self.cos, self.sin, pos, kc, vc, self.eps)
+                                                  self.cos, self.sin, pos, ki, vi, self.eps)
                         else:
-                            attn(q, kc, vc, pos)
+                            attn(q, ki, vi, pos)
 
                 run()
                 torch.cuda.synchronize()
@@ -598,11 +606,11 @@ class Engine:
                 graph.replay()
                 e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 e0.record()
-                for _ in range(3):
+                for _ in range(2):
                     graph.replay()
                 e1.record()
                 e1.synchronize()
-                timings.append((e0.elapsed_time(e1) * 1000.0 / (3 * reps), cand, attn))
+                timings.append((e0.elapsed_time(e1) * 1000.0 / (2 * reps), cand, attn))
             except Exception as exc:
                 torch.cuda.synchronize()
                 _log(f"  attn {cand}: skipped ({type(exc).__name__}: {str(exc)[:100]})")

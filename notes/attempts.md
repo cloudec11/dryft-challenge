@@ -10,7 +10,7 @@ workloads. Fill in the numbers from the run page.
 | 2 | daedece | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | 882.2 | yes | official run 4e9a638e, +3.1% over v1 |
 | 3 | 94660b0 | v3: prefill CUDA graph (raced), single-row GEMV for B1, lookahead 1 before first token | 882.7 | yes | official run 3bdf08de; B1 +13% but score flat -> hidden shapes are not batch 1 |
 | 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | 894.5 | yes | run a93ebf2b, +1.3%; TPOT down at every public shape |
-| 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | | | run b4494a7a |
+| 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | 882.2 | yes | run b4494a7a, **-1.4% regression**: the benchmark was L2-resident |
 | 6 | _tbd_ | v6: single-split attention writes its output directly (no reduce launch) | | | |
 | 7 | _tbd_ | v7: split-8 GEMV candidates, argmax writes the id buffer in place | | | |
 
@@ -230,3 +230,22 @@ of it. That makes kernel count, not arithmetic, the thing to attack next.
   The tuner skips any slice count that does not divide K by BLOCK_K.
 - `torch.argmax(..., out=ids)` instead of argmax-then-copy: one less launch
   per step, probed once at load so an unsupported out= cannot break capture.
+
+## v5 sample cases (run 5, official b4494a7a) - score 882.24 (-1.37%)
+
+| Workload | TPS | Batch time | TTFT | TPOT | Memory |
+|---|---:|---:|---:|---:|---:|
+| B1 512->32 | 238.0 | 134.5 ms | 10.61 ms | 3.996 ms | 10.34 GiB |
+| B4 2048->32 | 471.6 | 271.4 ms | 118.92 ms | 4.921 ms | 12.93 GiB |
+| B16 512->128 | 2761.8 | 741.5 ms | 107.22 ms | 4.987 ms | 13.19 GiB |
+
+A regression, and the cause is the benchmark, not the idea: `_tune_attention`
+replayed one layer's cache back to back, and one layer's KV is 42 MB at
+B16 x 640 slots, which fits in the 50 MB L2. It measured an L2-resident read
+and chose a tile for a regime the real step never sees (in the step, every
+layer's KV is cold). TPOT rose 2-3% at every shape, consistent with a tile
+that is wrong for cold reads.
+
+Lesson, the same one the GEMV tuner already encodes: **a warmup benchmark must
+touch as much distinct memory as the real step does.** Fixed by timing one
+call per layer over that layer's own cache.
