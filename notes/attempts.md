@@ -12,7 +12,7 @@ workloads. Fill in the numbers from the run page.
 | 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | 894.5 | yes | run a93ebf2b, +1.3%; TPOT down at every public shape |
 | 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | 882.2 | yes | run b4494a7a, **-1.4% regression**: the benchmark was L2-resident |
 | 6+7 | 6505b80 | v6 single-split attention + v7 split-8/argmax + cold-KV tuner fix | 888.2 | yes | run b54796c8; B16 best yet (715.8 ms), B1/B4 -2% |
-| 8 | _tbd_ | v8: noise-robust tuner decisions (3% margin, min-of-rounds) | | | |
+| 8 | cd5ef7c | v8: noise-robust tuner decisions (3% margin, min-of-rounds) | **902.9** | yes | run 84daa14e, **best so far, #22**; all three public shapes improved together |
 
 ## v1 design (branch `fast-engine`)
 
@@ -284,3 +284,61 @@ cause of B1 losing its single-row GEMV to a split-K candidate in run 6.
   Candidate lists are ordered so earlier means "what already worked".
 - Timings are the min over 2 rounds of 2 replays rather than the mean of 3,
   so one disturbed round cannot decide a race.
+
+## Run 7 (official 84daa14e, v8) - score 902.88, leaderboard #22
+
+| Workload | TPS | Batch time | TTFT | TPOT | Spread |
+|---|---:|---:|---:|---:|---:|
+| B1 512->32 | 244.4 | 130.9 ms | 10.55 ms | 3.883 ms | 0.7% |
+| B4 2048->32 | 482.2 | 265.4 ms | 116.74 ms | 4.807 ms | 0.9% |
+| B16 512->128 | 2858.8 | 716.4 ms | 105.09 ms | 4.808 ms | 0.1% |
+
+All three public shapes improved at once (B1 -1.8%, B4 -1.7%, B16 flat vs
+run 6), which is the signature of a real change rather than noise. The
+margin recovered what run 6 gave back at B1/B4 while keeping the
+single-split attention win at B16.
+
+Cumulative: 855.3 (v1) -> 902.9 (v8), +5.6%, and 22.9x the Transformers
+baseline's public-shape throughput at B1 (39.5 -> 244.4 tok/s... 6.2x;
+B16 582.8 -> 2858.8, 4.9x).
+
+## Where the remaining time is (v8, B16)
+
+Per step 4.808 ms against a ~2.8 ms floor (8.05 GB weights + 1.4 GB KV at
+3.35 TB/s), so ~58% of peak bandwidth. ~185 launches per step, each 9-30 us,
+so wave fill/drain and launch gaps are an estimated 0.8-0.9 ms of the 2.0 ms
+gap. cuBLAS was no better, so this is structural to one-kernel-per-stage
+decoding, and the per-stage decomposition is already minimal (5 launches per
+layer: QKV, attention, O, gate/up, down).
+
+Ideas left, both structural and both risky:
+
+1. **Speculative decoding** (prompt-lookup n-gram drafts, exact verification).
+   Legal and correct by construction. Verifying K+1 tokens costs almost the
+   same as 1 at these batch sizes because the step is weight-bound, so any
+   acceptance is a win. Risk: acceptance varies per prompt, so sample times
+   vary, and >25% spread fails the run (best score is kept, so the cost is a
+   wasted run). Needs per-sequence ragged positions in the cache, attention,
+   RoPE and cache writes: a moderate rewrite with no local GPU to debug on.
+2. **Decode megakernel** (one launch per layer or per step). Removes the
+   launch/ramp overhead, but Triton has no grid barrier; spin-waiting on
+   blocks that may not be co-resident can deadlock, and a hang burns the
+   300 s sample limit.
+
+## v9 changes
+
+Target: decode streams at 58% of peak. Besides the HBM weight stream, each
+step re-reads its activations out of L2 once per column tile: at BLOCK_N=16
+gate/up re-reads x 608 times (48 MB), down 160 times (50 MB), ~5.4 GB of L2
+traffic per step. Since every HBM read also passes through L2, that is close
+to a second bottleneck. Wider tiles fix it but cost programs -- unless K is
+split.
+
+- Split-K generalized from the two residual projections to every role but the
+  LM head: the split kernel now carries the RMSNorm prologue and writes gate
+  and up slices for the GLU role; the reduce kernel carries all three
+  epilogues (GLU, residual+sum-of-squares, plain).
+- Candidate order per role keeps v8's margin discipline: split-K leads for O
+  and down (where run 4 proved it), and has to win by 3% for QKV and gate/up.
+- Partial buffer is now [2 * MAX_SPLIT, BLOCK_M, intermediate] FP32 (10 MB at
+  batch 16), the widest any role needs.

@@ -146,8 +146,9 @@ class _FusedPlan:
         self.qkv = torch.empty((batch, self.n_qkv), dtype=dt, device=dev)
         self.act = torch.empty((batch, self.inter), dtype=dt, device=dev)
         self.logits = torch.empty((batch, self.vocab), dtype=dt, device=dev)
-        # FP32 slices for split-K on the residual-writing projections (N = hidden).
-        self.part = torch.empty((fused.MAX_SPLIT, self.bm, self.hidden),
+        # FP32 slices for split-K: MAX_SPLIT per output, twice over for the
+        # gate/up projection (gate and up slices), widest N of any role.
+        self.part = torch.empty((2 * fused.MAX_SPLIT, self.bm, self.inter),
                                 dtype=torch.float32, device=dev)
         self.ssq_a = torch.zeros((fused.SSQ_PARTS, self.bm), dtype=torch.float32, device=dev)
         self.ssq_b = torch.zeros_like(self.ssq_a)
@@ -512,11 +513,11 @@ class Engine:
         norm_w = self._role_norm(role) if norm else None
         weights = self._role_weights(role)
         parts_block = plan.parts_for(role)
-        # Split-K needs N == hidden (the partial buffer's width) and the
-        # RES_OUT epilogue, which is exactly the producer roles.
-        split_ok = role in plan.PRODUCERS and n == plan.hidden
+        # Every role but the LM head can split K; the partial buffer is sized
+        # for the widest of them.
+        split_ok = role != "lm" and n <= plan.inter
         timings = []
-        for cfg in fused.candidates(m, split_ok):
+        for cfg in fused.candidates(m, split_ok, split_first=role in plan.PRODUCERS):
             if n % cfg.bn or k % (cfg.bk * cfg.split) or cfg.bn > n:
                 continue
             if timings and time.perf_counter() > deadline:
