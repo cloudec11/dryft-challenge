@@ -4,17 +4,25 @@ What this changes relative to the Transformers baseline, and what it keeps:
 
 * Weights are the loaded module's own tensors; Q/K/V and gate/up are packed
   into one matrix each so a layer issues fewer, larger GEMMs.
-* Prefill runs eagerly and uses the same SDPA (FlashAttention) call as the
-  baseline, on the same GQA-expanded keys and values.
+* Prefill runs eagerly and uses FlashAttention like the baseline, but passes
+  the 8 KV heads directly (``enable_gqa``) instead of materialising 32
+  expanded copies; it falls back to the baseline's expanded call if that
+  path is unavailable or disagrees at load time.
 * Decode is one CUDA graph per (batch, prompt, output) shape, captured during
   the untimed warmup call. It reads the token and position from device
-  buffers, attends with a split-K Triton kernel over a fixed-capacity cache,
-  takes the argmax on the GPU and advances the position itself, so step t+1
-  is queued before step t's tokens are handed to the caller.
-* Fused Triton kernels (residual add + RMSNorm, head norm + RoPE + cache
-  write, SwiGLU) round to BF16 at exactly the points the reference does. Each
-  one is checked against its PyTorch twin at load time and replaced by the
-  twin if it disagrees or fails to compile.
+  buffers, takes the argmax on the GPU and advances the position itself, so
+  later steps are queued before earlier tokens are handed to the caller.
+* Two decode steps exist. v1: cuBLAS projections plus fused Triton kernels
+  (residual add + RMSNorm, head norm + RoPE + cache write, SwiGLU, split-K
+  GQA attention). v2 (``kernels/fused.py``): skinny Triton GEMMs with the
+  norms, SwiGLU and residual adds folded into them and the head norm + RoPE
+  folded into attention, 6 launches per layer instead of 10. During warmup
+  v2's tiles are tuned, its logits are checked against v1 on a synthetic
+  prompt, both steps are captured and timed, and the faster one that agrees
+  runs the samples.
+* Every kernel rounds to BF16 at exactly the points the reference does; only
+  reduction order differs. Each v1 kernel is checked against its PyTorch twin
+  at load time and replaced by the twin if it disagrees or fails to compile.
 """
 
 import os
@@ -41,7 +49,19 @@ _ensure_triton_cache()
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from kernels import ops  # noqa: E402
+from kernels import fused, ops  # noqa: E402
+
+try:  # PyTorch >= 2.3
+    from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
+except ImportError:  # pragma: no cover
+    SDPBackend = sdpa_kernel = None
+
+# Decode steps queued ahead of the one being handed to the caller.
+LOOKAHEAD = 3
+# Largest batch the fused decode step is tried at (it is BLOCK_M of its GEMMs).
+FUSED_MAX_BATCH = 64
+# Warmup seconds allowed for tuning the fused step's GEMM tiles.
+TUNE_BUDGET_S = 90.0
 
 
 def _log(message):
@@ -79,6 +99,43 @@ class _ShapeState:
         self.host = torch.empty((new_tokens, batch), dtype=torch.int64, pin_memory=on_cuda)
         self.events = [torch.cuda.Event() for _ in range(new_tokens)] if on_cuda else None
         self.graph = None
+        self.step = engine._decode_step  # eager step (fallback / capture source)
+        self.fused = None  # _FusedPlan when the fused step is in use
+
+
+class _FusedPlan:
+    """Static buffers and tuned tile configs for the fused decode step."""
+
+    ROLES = ("qkv", "o", "gate_up", "down", "lm")
+
+    def __init__(self, engine, batch):
+        dev, dt = engine.device, engine.dtype
+        layer = engine.layers[0]
+        self.m = batch
+        self.bm = max(16, 1 << (batch - 1).bit_length())
+        self.hidden = engine.norm_w.shape[0]
+        self.inter = layer.down.shape[1]
+        self.n_qkv = layer.qkv.shape[0]
+        self.k_o = layer.o.shape[1]
+        self.vocab = engine.lm_w.shape[0]
+        self.h = torch.zeros((batch, self.hidden), dtype=dt, device=dev)
+        self.qkv = torch.empty((batch, self.n_qkv), dtype=dt, device=dev)
+        self.act = torch.empty((batch, self.inter), dtype=dt, device=dev)
+        self.logits = torch.empty((batch, self.vocab), dtype=dt, device=dev)
+        self.ssq_a = torch.zeros((fused.SSQ_PARTS, self.bm), dtype=torch.float32, device=dev)
+        self.ssq_b = torch.zeros_like(self.ssq_a)
+        self.cfg = {}
+        self.parts_o = self.parts_down = 0
+
+    def dims(self, role):
+        """(n, k, norm, glu, res) of one projection role."""
+        return {
+            "qkv": (self.n_qkv, self.hidden, True, False, False),
+            "o": (self.hidden, self.k_o, False, False, True),
+            "gate_up": (self.inter, self.hidden, True, True, False),
+            "down": (self.hidden, self.inter, False, False, True),
+            "lm": (self.vocab, self.hidden, True, False, False),
+        }[role]
 
 
 class Engine:
@@ -89,6 +146,9 @@ class Engine:
         start = time.perf_counter()
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        props = torch.cuda.get_device_properties(0)
+        _log(f"device {props.name}, {props.multi_processor_count} SMs, "
+             f"{props.total_memory / 2**30:.1f} GiB, torch {torch.__version__}")
         model = (
             AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -144,9 +204,9 @@ class Engine:
             layer.qkv = torch.cat(
                 [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
             ).contiguous()
-            layer.o = attn.o_proj.weight
+            layer.o = attn.o_proj.weight.contiguous()
             layer.gate_up = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0).contiguous()
-            layer.down = mlp.down_proj.weight
+            layer.down = mlp.down_proj.weight.contiguous()
             # Drop the unpacked projections so they don't hold a second copy.
             base.layers[i] = torch.nn.Identity()
             self.layers.append(layer)
@@ -163,16 +223,28 @@ class Engine:
         self.k_qkv_post = ops.qkv_post_ref
         self.k_silu_mul = ops.silu_mul_ref
         self.use_triton_attn = False
-        if not use_triton:
-            _log("kernels: PyTorch reference path")
-            return
+        self.prefill_gqa = False
+        self.fused_ok = use_triton and self.device.type == "cuda"
         chosen = {}
+        if self.device.type == "cuda":
+            try:
+                ok, detail = self._check_prefill_gqa()
+            except Exception as exc:
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            self.prefill_gqa = ok
+            chosen["prefill_attn"] = "flash-gqa" if ok else f"expanded ({detail})"
+        if not use_triton:
+            _log("kernels: PyTorch reference path; " + ", ".join(f"{k}={v}" for k, v in chosen.items()))
+            return
         for name, check, fast in (
             ("add_norm", self._check_add_norm, ops.add_rms_norm),
-            ("qkv_post", self._check_qkv_post, ops.qkv_post),
+            ("qkv_post", lambda: self._check_qkv_post(ops.qkv_post_rows), ops.qkv_post_rows),
+            ("qkv_post_v1", lambda: self._check_qkv_post(ops.qkv_post), ops.qkv_post),
             ("silu_mul", self._check_silu_mul, ops.silu_mul),
             ("decode_attn", self._check_decode_attn, None),
         ):
+            if name == "qkv_post_v1" and self.k_qkv_post is not ops.qkv_post_ref:
+                continue  # the row kernel already passed
             try:
                 ok, detail = check()
             except Exception as exc:  # compile or launch failure: keep PyTorch
@@ -180,7 +252,7 @@ class Engine:
             chosen[name] = "triton" if ok else f"reference ({detail})"
             if ok and name == "add_norm":
                 self.k_add_norm = fast
-            elif ok and name == "qkv_post":
+            elif ok and name in ("qkv_post", "qkv_post_v1"):
                 self.k_qkv_post = fast
             elif ok and name == "silu_mul":
                 self.k_silu_mul = fast
@@ -218,7 +290,7 @@ class Engine:
             results += [self._agree(a, b), self._agree(ah, bh)]
         return all(ok for ok, _ in results), "; ".join(d for _, d in results)
 
-    def _check_qkv_post(self):
+    def _check_qkv_post(self, fast):
         batch, T, cap = 2, 3, 64
         self._ensure_rope(cap)
         width = (self.nq + 2 * self.nkv) * self.head_dim
@@ -226,7 +298,7 @@ class Engine:
         pos = torch.tensor([7], dtype=torch.int32, device=self.device)
         layer = self.layers[0]
         outs = []
-        for fn in (ops.qkv_post, ops.qkv_post_ref):
+        for fn in (fast, ops.qkv_post_ref):
             kc = torch.zeros((batch, self.nkv, cap, self.head_dim), dtype=self.dtype, device=self.device)
             vc = torch.zeros_like(kc)
             q = fn(qkv, layer.q_norm, layer.k_norm, self.cos, self.sin, pos, kc, vc,
@@ -255,6 +327,17 @@ class Engine:
             results.append(self._agree(fast, ref, min_exact=0.0))
         return all(ok for ok, _ in results), "; ".join(d for _, d in results)
 
+    def _check_prefill_gqa(self):
+        if sdpa_kernel is None:
+            return False, "no torch.nn.attention"
+        batch, T, cap = 2, 80, 96
+        q = self._randn(batch * T, self.nq * self.head_dim, scale=2.0)
+        kc = self._randn(batch, self.nkv, cap, self.head_dim, scale=2.0)
+        vc = self._randn(batch, self.nkv, cap, self.head_dim)
+        fast = self._attend_prefill(q, kc, vc, batch, T, gqa=True)
+        ref = self._attend_prefill(q, kc, vc, batch, T, gqa=False)
+        return self._agree(fast, ref, min_exact=0.9)
+
     # ---------------------------------------------------------------- forward
 
     def _ensure_rope(self, capacity):
@@ -282,17 +365,28 @@ class Engine:
             n, res = self.k_add_norm(d, res, next_w, self.eps)
         return n
 
+    def _attend_prefill(self, q, kc, vc, batch, T, gqa):
+        """Causal attention of ``q`` ``[B*T, nq*D]`` over cache slots ``[0, T)``."""
+        q4 = q.view(batch, T, self.nq, self.head_dim).transpose(1, 2)
+        if gqa:
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                o = F.scaled_dot_product_attention(
+                    q4, kc[:, :, :T], vc[:, :, :T], is_causal=True, scale=self.scaling,
+                    enable_gqa=True,
+                )
+        else:
+            group = self.nq // self.nkv
+            k = _repeat_kv(kc[:, :, :T], group)
+            v = _repeat_kv(vc[:, :, :T], group)
+            o = F.scaled_dot_product_attention(q4.contiguous(), k, v, is_causal=True, scale=self.scaling)
+        return o.transpose(1, 2).reshape(batch * T, self.nq * self.head_dim)
+
     def _prefill(self, st, ids):
         batch, T = ids.shape
         zero = torch.zeros((1,), dtype=torch.int32, device=self.device)
-        group = self.nq // self.nkv
 
         def attend(q, kc, vc):
-            q4 = q.view(batch, T, self.nq, self.head_dim).transpose(1, 2).contiguous()
-            k = _repeat_kv(kc[:, :, :T], group)
-            v = _repeat_kv(vc[:, :, :T], group)
-            o = F.scaled_dot_product_attention(q4, k, v, is_causal=True, scale=self.scaling)
-            return o.transpose(1, 2).reshape(batch * T, self.nq * self.head_dim)
+            return self._attend_prefill(q, kc, vc, batch, T, self.prefill_gqa)
 
         x = F.embedding(ids.reshape(-1), self.embed_w)
         n = self._layers_forward(x, T, zero, st.k_cache, st.v_cache, attend)
@@ -300,7 +394,8 @@ class Engine:
         return torch.argmax(F.linear(last, self.lm_w), dim=-1)
 
     def _decode_step(self, st):
-        """One token per sequence at position ``st.pos``; graph-capturable."""
+        """v1: one token per sequence at position ``st.pos``; graph-capturable.
+        Returns the step's logits."""
         if self.use_triton_attn:
             def attend(q, kc, vc):
                 return st.attn(q, kc, vc, st.pos)
@@ -310,8 +405,174 @@ class Engine:
 
         x = F.embedding(st.ids, self.embed_w)
         n = self._layers_forward(x, 1, st.pos, st.k_cache, st.v_cache, attend)
-        st.ids.copy_(torch.argmax(F.linear(n, self.lm_w), dim=-1))
+        logits = F.linear(n, self.lm_w)
+        st.ids.copy_(torch.argmax(logits, dim=-1))
         st.pos.add_(1)
+        return logits
+
+    def _decode_step_fused(self, st):
+        """v2: the same step from ``kernels/fused.py``; graph-capturable.
+
+        The residual stream lives in ``f.h`` and is updated in place by the O
+        and down projections; ``ssq_a``/``ssq_b`` carry the per-row sums of
+        squares that the next RMSNorm needs (a after O, b after down/embed)."""
+        f = st.fused
+        m, bm, c, eps, hid = f.m, f.bm, f.cfg, self.eps, f.hidden
+        a_buf, b_buf = f.ssq_a, f.ssq_b
+        fused.embed_ssq(st.ids, self.embed_w, f.h, b_buf)
+        parts = 1
+        for i, layer in enumerate(self.layers):
+            fused.gemv(f.h, layer.qkv, f.qkv, m, f.n_qkv, hid, c["qkv"], bm, b_buf, a_buf, eps,
+                       norm_w=layer.in_w, n_parts=parts)
+            a = fused.attention_fused(st.attn, f.qkv, layer.q_norm, layer.k_norm, self.cos,
+                                      self.sin, st.pos, st.k_cache[i], st.v_cache[i], eps)
+            fused.gemv(a, layer.o, None, m, hid, f.k_o, c["o"], bm, b_buf, a_buf, eps, res=f.h)
+            fused.gemv(f.h, layer.gate_up, f.act, m, f.inter, hid, c["gate_up"], bm, a_buf, b_buf,
+                       eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True)
+            fused.gemv(f.act, layer.down, None, m, hid, f.inter, c["down"], bm, a_buf, b_buf, eps,
+                       res=f.h)
+            parts = f.parts_down
+        fused.gemv(f.h, self.lm_w, f.logits, m, f.vocab, hid, c["lm"], bm, b_buf, a_buf, eps,
+                   norm_w=self.norm_w, n_parts=parts)
+        st.ids.copy_(torch.argmax(f.logits, dim=-1))
+        st.pos.add_(1)
+        return f.logits
+
+    # ------------------------------------------------------------ fused setup
+
+    def _role_weights(self, role):
+        if role == "lm":
+            return [self.lm_w] * 4
+        attr = {"qkv": "qkv", "o": "o", "gate_up": "gate_up", "down": "down"}[role]
+        return [getattr(layer, attr) for layer in self.layers]
+
+    def _role_norm(self, role):
+        return {"qkv": self.layers[0].in_w, "gate_up": self.layers[0].post_w,
+                "lm": self.norm_w}.get(role)
+
+    def _tune_gemv(self, plan, role, deadline):
+        """Time every candidate tile over all 36 layers' weights (so nothing
+        sits in L2) inside a CUDA graph; return the fastest that runs."""
+        n, k, norm, glu, res = plan.dims(role)
+        m, bm = plan.m, plan.bm
+        x = self._randn(m, k)
+        out = torch.empty((m, n), dtype=self.dtype, device=self.device)
+        res_buf = self._randn(m, n) if res else None
+        ssq_in = torch.full((fused.SSQ_PARTS, bm), float(k), dtype=torch.float32, device=self.device)
+        ssq_out = torch.zeros_like(ssq_in)
+        norm_w = self._role_norm(role) if norm else None
+        weights = self._role_weights(role)
+        timings = []
+        for cfg in fused.GEMV_CANDIDATES:
+            if n % cfg.bn or k % cfg.bk:
+                continue
+            if timings and time.perf_counter() > deadline:
+                break
+
+            def run():
+                for w in weights:
+                    fused.gemv(x, w, None if res else out, m, n, k, cfg, bm, ssq_in, ssq_out,
+                               self.eps, norm_w=norm_w, n_parts=1, res=res_buf, glu=glu)
+
+            graph = None
+            try:
+                run()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
+                graph.replay()
+                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                e0.record()
+                for _ in range(3):
+                    graph.replay()
+                e1.record()
+                e1.synchronize()
+                timings.append((e0.elapsed_time(e1) * 1000.0 / (3 * len(weights)), cfg))
+            except Exception as exc:
+                torch.cuda.synchronize()
+                _log(f"  {role} {cfg}: skipped ({type(exc).__name__}: {str(exc)[:120]})")
+            finally:
+                del graph
+        if not timings:
+            raise RuntimeError(f"no GEMV tile ran for {role}")
+        timings.sort(key=lambda t: t[0])
+        us, best = timings[0]
+        moved = (n * k * (2 if glu else 1)) * 2 / 1e3  # KB of weight per call
+        _log(f"  {role} n={n} k={k}: best {best} {us:.1f}us ({moved / us:.0f} GB/s); "
+             + " ".join(f"{c}={t:.1f}" for t, c in timings[1:]))
+        return best
+
+    def _check_fused(self, st, prompt_len, new_tokens):
+        """Logits of the fused step vs the v1 step on the same synthetic
+        prompt and the same forced tokens, over a few consecutive steps."""
+        batch = st.batch
+        n_check = min(3, new_tokens)
+        gen = torch.Generator(device="cpu").manual_seed(4321)
+        prompt = torch.randint(100, 100000, (batch, prompt_len), generator=gen).to(self.device)
+        toks = torch.randint(100, 100000, (n_check, batch), generator=gen).to(self.device)
+        self._prefill(st, prompt)
+        refs = []
+        for t in range(n_check):
+            st.pos.fill_(prompt_len + t)
+            st.ids.copy_(toks[t])
+            refs.append(self._decode_step(st).float())
+        max_d = mean_d = 0.0
+        agree = 0
+        for t in range(n_check):
+            st.pos.fill_(prompt_len + t)
+            st.ids.copy_(toks[t])
+            got = self._decode_step_fused(st).float()
+            if not torch.isfinite(got).all():
+                return False, "non-finite logits"
+            diff = (got - refs[t]).abs()
+            max_d = max(max_d, diff.max().item())
+            mean_d = max(mean_d, diff.mean().item())
+            agree += (got.argmax(-1) == refs[t].argmax(-1)).sum().item()
+        ok = max_d <= 1.5 and mean_d <= 0.1
+        return ok, f"max|dlogit|={max_d:.3f} mean={mean_d:.4f} argmax {agree}/{n_check * batch}"
+
+    def _time_graph(self, st, graph, prompt_len, reps):
+        st.pos.fill_(prompt_len)
+        graph.replay()
+        st.pos.fill_(prompt_len)
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(reps):
+            graph.replay()
+        e1.record()
+        e1.synchronize()
+        return e0.elapsed_time(e1) / reps
+
+    def _try_fused(self, st, prompt_len, new_tokens):
+        start = time.perf_counter()
+        plan = _FusedPlan(self, st.batch)
+        st.fused = plan
+        deadline = start + TUNE_BUDGET_S
+        for role in plan.ROLES:
+            plan.cfg[role] = self._tune_gemv(plan, role, deadline)
+        plan.parts_o = plan.hidden // plan.cfg["o"].bn
+        plan.parts_down = plan.hidden // plan.cfg["down"].bn
+        ok, detail = self._check_fused(st, prompt_len, new_tokens)
+        _log(f"fused step vs v1: {detail} -> {'ok' if ok else 'REJECTED'}")
+        if not ok:
+            st.fused = None
+            return
+        graph = self._capture(st, self._decode_step_fused)
+        reps = min(16, new_tokens)
+        t_v1, t_fused = [], []
+        for _ in range(2):
+            t_v1.append(self._time_graph(st, st.graph, prompt_len, reps))
+            t_fused.append(self._time_graph(st, graph, prompt_len, reps))
+        t_v1, t_fused = min(t_v1), min(t_fused)
+        use = t_fused < t_v1
+        _log(f"decode step: v1 {t_v1:.3f} ms, fused {t_fused:.3f} ms -> "
+             f"{'fused' if use else 'v1'} (fused setup {time.perf_counter() - start:.1f}s)")
+        if use:
+            st.graph = graph
+            st.step = self._decode_step_fused
+        else:
+            st.fused = None
 
     # ------------------------------------------------------------- generation
 
@@ -327,18 +588,27 @@ class Engine:
         self._ensure_rope(st.capacity)
         if self.use_graphs and new_tokens > 1:
             try:
-                st.graph = self._capture(st)
+                st.graph = self._capture(st, self._decode_step)
             except Exception as exc:
                 torch.cuda.synchronize()
                 _log(f"graph capture failed, decoding eagerly: {type(exc).__name__}: {exc}")
                 st.graph = None
+            if st.graph is not None and self.fused_ok and batch <= FUSED_MAX_BATCH:
+                try:
+                    self._try_fused(st, prompt_len, new_tokens)
+                except Exception as exc:
+                    torch.cuda.synchronize()
+                    _log(f"fused step unavailable: {type(exc).__name__}: {str(exc)[:300]}")
+                    st.fused = None
+                    st.step = self._decode_step
         self.state = st
         _log(f"shape B={batch} S={prompt_len} N={new_tokens}: capacity {st.capacity}, "
              f"{st.attn.splits} attention splits, graph={'yes' if st.graph else 'no'}, "
+             f"step={'fused' if st.fused is not None else 'v1'}, "
              f"setup {time.perf_counter() - start:.2f}s")
         return st
 
-    def _capture(self, st):
+    def _capture(self, st, step):
         # Warm on a side stream (compiles kernels, creates cuBLAS handles),
         # then record. The warm steps scribble into cache slots that the next
         # prefill overwrites; no generation ever reads them.
@@ -348,11 +618,11 @@ class Engine:
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(2):
-                self._decode_step(st)
+                step(st)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            self._decode_step(st)
+            step(st)
         torch.cuda.synchronize()
         return graph
 
@@ -360,7 +630,7 @@ class Engine:
         if st.graph is not None:
             st.graph.replay()
         else:
-            self._decode_step(st)
+            st.step(st)
         self._publish(st, step)
 
     def _publish(self, st, step):
@@ -389,14 +659,21 @@ class Engine:
             st = self._state_for(batch, prompt_len, steps)
             # Everything prompt-dependent is rewritten here: cache slots
             # [0, S) by prefill, then S onwards one step at a time; attention
-            # never reads past the current position.
+            # never reads past the current position. The fused step's
+            # residual and norm buffers are rebuilt from the token each step.
             st.ids.copy_(self._prefill(st, ids))
             st.pos.fill_(prompt_len)
             self._publish(st, 0)
-        for step in range(1, steps):
-            # Queue step t before handing over step t-1: the GPU works while
-            # the caller consumes tokens.
-            with torch.inference_mode():
-                self._launch_step(st, step)
-            yield self._fetch(st, step - 1)
-        yield self._fetch(st, steps - 1)
+        # Keep the GPU LOOKAHEAD steps ahead of the caller: each step's graph
+        # reads the token the previous one wrote on the device, and its copy
+        # to the host is queued right behind it.
+        ahead = LOOKAHEAD if st.graph is not None else 1
+        launched = 1
+        for step in range(steps):
+            target = min(steps, step + 1 + ahead)
+            if launched < target:
+                with torch.inference_mode():
+                    while launched < target:
+                        self._launch_step(st, launched)
+                        launched += 1
+            yield self._fetch(st, step)
