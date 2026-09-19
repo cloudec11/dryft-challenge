@@ -75,6 +75,11 @@ FUSED_MAX_BATCH = 128
 # decode attention tile shape.
 TUNE_BUDGET_S = 90.0
 ATTN_TUNE_BUDGET_S = 25.0
+# A later candidate has to win by this much to displace an earlier one. Runs
+# vary by ~1-2% on identical code, so picking the bare minimum of a set of
+# noisy measurements is how a tuner talks itself into a worse configuration;
+# the candidate lists are ordered so that earlier means safer.
+MARGIN = 0.97
 
 
 def _log(message):
@@ -531,13 +536,7 @@ class Engine:
                 with torch.cuda.graph(graph):
                     run()
                 graph.replay()
-                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                e0.record()
-                for _ in range(3):
-                    graph.replay()
-                e1.record()
-                e1.synchronize()
-                timings.append((e0.elapsed_time(e1) * 1000.0 / (3 * len(weights)), cfg))
+                timings.append((self._time_replays(graph, 2, 2) * 1000.0 / len(weights), cfg))
             except Exception as exc:
                 torch.cuda.synchronize()
                 _log(f"  {role} {cfg}: skipped ({type(exc).__name__}: {str(exc)[:120]})")
@@ -545,11 +544,13 @@ class Engine:
                 del graph
         if not timings:
             raise RuntimeError(f"no GEMV tile ran for {role}")
-        timings.sort(key=lambda t: t[0])
         us, best = timings[0]
+        for t, cfg in timings[1:]:
+            if t < us * MARGIN:
+                us, best = t, cfg
         moved = (n * k * (2 if glu else 1)) * 2 / 1e3  # KB of weight per call
         _log(f"  {role} n={n} k={k}: best {best} {us:.1f}us ({moved / us:.0f} GB/s); "
-             + " ".join(f"{c}={t:.1f}" for t, c in timings[1:]))
+             + " ".join(f"{c}={t:.1f}" for t, c in timings))
         return best
 
     def _tune_attention(self, st, deadline):
@@ -604,13 +605,7 @@ class Engine:
                 with torch.cuda.graph(graph):
                     run()
                 graph.replay()
-                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                e0.record()
-                for _ in range(2):
-                    graph.replay()
-                e1.record()
-                e1.synchronize()
-                timings.append((e0.elapsed_time(e1) * 1000.0 / (2 * reps), cand, attn))
+                timings.append((self._time_replays(graph, 2, 2) * 1000.0 / reps, cand, attn))
             except Exception as exc:
                 torch.cuda.synchronize()
                 _log(f"  attn {cand}: skipped ({type(exc).__name__}: {str(exc)[:100]})")
@@ -620,14 +615,17 @@ class Engine:
                 break
         if not timings:
             return
-        timings.sort(key=lambda t: t[0])
+        # timings[0] is the configuration v1-v4 used; only a clear win moves off it.
         us, cand, attn = timings[0]
+        for t, c, a in timings[1:]:
+            if t < us * MARGIN:
+                us, cand, attn = t, c, a
         ok, detail = self._agree(attn(q, kc, vc, pos),
                                  ops.decode_attention_ref(q, kc, vc, pos, self.nq, self.nkv),
                                  min_exact=0.0)
         kv_kb = batch * self.nkv * cap * self.head_dim * 2 * 2 / 1e3
         _log(f"  attn best {cand} {us:.1f}us ({kv_kb / us:.0f} GB/s of KV), {detail}; "
-             + " ".join(f"{c}={t:.1f}" for t, c, _ in timings[1:]))
+             + " ".join(f"{c}={t:.1f}" for t, c, _ in timings))
         if ok:
             st.attn = attn
 
@@ -659,6 +657,21 @@ class Engine:
             agree += (got.argmax(-1) == refs[t].argmax(-1)).sum().item()
         ok = max_d <= 1.5 and mean_d <= 0.1
         return ok, f"max|dlogit|={max_d:.3f} mean={mean_d:.4f} argmax {agree}/{n_check * batch}"
+
+    @staticmethod
+    def _time_replays(graph, rounds, reps):
+        """Min over rounds of the mean replay time, in ms. Min over rounds
+        rejects a round that lost the GPU to something else."""
+        best = float("inf")
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        for _ in range(rounds):
+            e0.record()
+            for _ in range(reps):
+                graph.replay()
+            e1.record()
+            e1.synchronize()
+            best = min(best, e0.elapsed_time(e1) / reps)
+        return best
 
     def _time_graph(self, st, graph, prompt_len, reps):
         st.pos.fill_(prompt_len)
@@ -698,7 +711,7 @@ class Engine:
             t_v1.append(self._time_graph(st, st.graph, prompt_len, reps))
             t_fused.append(self._time_graph(st, graph, prompt_len, reps))
         t_v1, t_fused = min(t_v1), min(t_fused)
-        use = t_fused < t_v1
+        use = t_fused < t_v1 * MARGIN
         _log(f"decode step: v1 {t_v1:.3f} ms, fused {t_fused:.3f} ms -> "
              f"{'fused' if use else 'v1'} (fused setup {time.perf_counter() - start:.1f}s)")
         if use:
@@ -789,7 +802,7 @@ class Engine:
             st.prefill_out = self._prefill(st, st.prefill_ids)
         torch.cuda.synchronize()
         t_graph = timed(graph.replay)
-        keep = t_graph < t_eager
+        keep = t_graph < t_eager * MARGIN
         _log(f"prefill: eager {t_eager:.2f} ms, graph {t_graph:.2f} ms -> "
              f"{'graph' if keep else 'eager'} (setup {time.perf_counter() - start:.1f}s)")
         if keep:
