@@ -324,3 +324,21 @@ Ideas left, both structural and both risky:
    launch/ramp overhead, but Triton has no grid barrier; spin-waiting on
    blocks that may not be co-resident can deadlock, and a hang burns the
    300 s sample limit.
+
+## v9 changes
+
+Target: decode streams at 58% of peak. Besides the HBM weight stream, each
+step re-reads its activations out of L2 once per column tile: at BLOCK_N=16
+gate/up re-reads x 608 times (48 MB), down 160 times (50 MB), ~5.4 GB of L2
+traffic per step. Since every HBM read also passes through L2, that is close
+to a second bottleneck. Wider tiles fix it but cost programs -- unless K is
+split.
+
+- Split-K generalized from the two residual projections to every role but the
+  LM head: the split kernel now carries the RMSNorm prologue and writes gate
+  and up slices for the GLU role; the reduce kernel carries all three
+  epilogues (GLU, residual+sum-of-squares, plain).
+- Candidate order per role keeps v8's margin discipline: split-K leads for O
+  and down (where run 4 proved it), and has to win by 3% for QKV and gate/up.
+- Partial buffer is now [2 * MAX_SPLIT, BLOCK_M, intermediate] FP32 (10 MB at
+  batch 16), the widest any role needs.

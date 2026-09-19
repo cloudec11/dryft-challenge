@@ -150,61 +150,102 @@ def _gemv_vec_kernel(
         tl.store(out_ptr + offs_n, y.to(dt))
 
 
-MAX_SPLIT = 8  # rows of the FP32 partial buffer a split-K projection needs
+MAX_SPLIT = 8  # slices of the FP32 partial buffer a split-K projection may use
 
 
 @triton.jit
 def _gemv_splitk_kernel(
     x_ptr, w_ptr, part_ptr, M, N, K,
+    nw_ptr, ssq_in_ptr, n_parts_in, eps,
+    NORM_IN: tl.constexpr, GLU: tl.constexpr,
     SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr,
 ):
-    # One program per (column tile, K slice). N = 2560 tiles into only 160
-    # programs at BLOCK_N = 16, so a plain grid leaves the second wave a
-    # fifth full on 132 SMs; splitting K multiplies the program count and
-    # lets BLOCK_N grow, which also cuts the repeated reads of x.
+    # One program per (column tile, K slice), writing FP32 partials. Splitting
+    # K buys two things: more programs (N=2560 tiles into only 160 of them at
+    # BLOCK_N=16, leaving the second wave a fifth full on 132 SMs) and the
+    # freedom to widen BLOCK_N, which is what cuts the repeated reads of x --
+    # at BLOCK_N=16 gate/up re-reads x 608 times per layer, and every one of
+    # those reads goes through the same L2 as the weight stream.
     pid_n = tl.program_id(0)
     s = tl.program_id(1)
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < M
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
+    dt = w_ptr.dtype.element_ty
     k_span = K // SPLIT
     k_start = s * k_span
+
+    if NORM_IN:
+        offs_p = tl.arange(0, PARTS)
+        ss = tl.load(ssq_in_ptr + offs_p[:, None] * SS_STRIDE + offs_m[None, :],
+                     mask=(offs_p[:, None] < n_parts_in) & m_mask[None, :], other=0.0)
+        rstd = tl.math.rsqrt(tl.sum(ss, axis=0) / K + eps)
+
     x_ptrs = x_ptr + offs_m[:, None] * K + k_start + offs_k[None, :]
     w_ptrs = w_ptr + offs_n[None, :].to(tl.int64) * K + k_start + offs_k[:, None]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for _ in range(0, k_span, BLOCK_K):
+    if GLU:
+        wu_ptrs = w_ptrs + N.to(tl.int64) * K
+        acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(k_start, k_start + k_span, BLOCK_K):
         x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        if NORM_IN:
+            nw = tl.load(nw_ptr + k0 + offs_k).to(tl.float32)
+            xn = (x.to(tl.float32) * rstd[:, None]).to(dt)
+            x = (nw[None, :] * xn.to(tl.float32)).to(dt)
         w = tl.load(w_ptrs)
         acc += tl.dot(x, w)
+        if GLU:
+            wu = tl.load(wu_ptrs)
+            acc_u += tl.dot(x, wu)
+            wu_ptrs += BLOCK_K
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K
+
     dst = part_ptr + s * (BLOCK_M * N) + offs_m[:, None] * N + offs_n[None, :]
     tl.store(dst, acc, mask=m_mask[:, None])
+    if GLU:
+        tl.store(dst + SPLIT * (BLOCK_M * N), acc_u, mask=m_mask[:, None])
 
 
 @triton.jit
 def _gemv_splitk_reduce_kernel(
-    part_ptr, res_ptr, ssq_out_ptr, M, N,
+    part_ptr, out_ptr, res_ptr, ssq_out_ptr, M, N,
+    GLU: tl.constexpr, RES_OUT: tl.constexpr,
     SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SS_STRIDE: tl.constexpr,
 ):
-    # Sums the FP32 slices and runs the RES_OUT epilogue. The slices add up
-    # in FP32 and round to BF16 once, exactly as the unsplit GEMM does.
+    # Sums the FP32 slices, then the same epilogue the unsplit kernel runs.
+    # Slices add in FP32 and round to BF16 once, so this is a reordering of
+    # the same sum, not a different function.
     pid = tl.program_id(0)
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < M
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     off = offs_m[:, None] * N + offs_n[None, :]
-    dt = res_ptr.dtype.element_ty
+    dt = out_ptr.dtype.element_ty
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for s in tl.static_range(SPLIT):
         acc += tl.load(part_ptr + s * (BLOCK_M * N) + off, mask=m_mask[:, None], other=0.0)
-    d = acc.to(dt).to(tl.float32)
-    r = tl.load(res_ptr + off, mask=m_mask[:, None], other=0.0).to(tl.float32)
-    h = (r + d).to(dt)
-    tl.store(res_ptr + off, h, mask=m_mask[:, None])
-    hf = tl.where(m_mask[:, None], h.to(tl.float32), 0.0)
-    tl.store(ssq_out_ptr + pid * SS_STRIDE + offs_m, tl.sum(hf * hf, axis=1), mask=m_mask)
+    if GLU:
+        acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for s in tl.static_range(SPLIT):
+            acc_u += tl.load(part_ptr + (SPLIT + s) * (BLOCK_M * N) + off,
+                             mask=m_mask[:, None], other=0.0)
+        g = acc.to(dt).to(tl.float32)
+        u = acc_u.to(dt).to(tl.float32)
+        a = (g / (1.0 + tl.exp(-g))).to(dt).to(tl.float32)
+        tl.store(out_ptr + off, (a * u).to(dt), mask=m_mask[:, None])
+    elif RES_OUT:
+        d = acc.to(dt).to(tl.float32)
+        r = tl.load(res_ptr + off, mask=m_mask[:, None], other=0.0).to(tl.float32)
+        h = (r + d).to(dt)
+        tl.store(res_ptr + off, h, mask=m_mask[:, None])
+        hf = tl.where(m_mask[:, None], h.to(tl.float32), 0.0)
+        tl.store(ssq_out_ptr + pid * SS_STRIDE + offs_m, tl.sum(hf * hf, axis=1), mask=m_mask)
+    else:
+        tl.store(out_ptr + off, acc.to(dt), mask=m_mask[:, None])
 
 
 class GemvConfig:
@@ -237,9 +278,8 @@ GEMV_CANDIDATES = (
 )
 
 
-# Only the residual-writing projections (N = hidden) use split-K: the others
-# already tile into enough programs, and their prologues/epilogues would have
-# to move into the reduce kernel.
+# Every projection except the LM head can split K (the head already tiles into
+# thousands of programs, and its partial buffer would be 39 MB).
 GEMV_SPLITK_CANDIDATES = (
     GemvConfig(64, 256, 3, 4, split=2),
     GemvConfig(32, 256, 3, 4, split=2),
@@ -251,13 +291,16 @@ GEMV_SPLITK_CANDIDATES = (
 )
 
 
-def candidates(m, split_ok=False):
+def candidates(m, split_ok=False, split_first=False):
     base = (GEMV_VEC_CANDIDATES + GEMV_CANDIDATES[:3]) if m == 1 else GEMV_CANDIDATES
     if not split_ok:
         return base
-    # Split-K first: it is the candidate that fixes the wave quantization of
-    # the N = 2560 projections, and the budget may not reach the whole list.
-    return GEMV_SPLITK_CANDIDATES + base[:3]
+    # Order matters: the first candidate is the incumbent that a later one has
+    # to beat by MARGIN. Split-K leads for the projections where it already
+    # won (O and down, run 4); elsewhere it has to prove itself.
+    if split_first:
+        return GEMV_SPLITK_CANDIDATES + base[:3]
+    return base + GEMV_SPLITK_CANDIDATES
 
 
 def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
@@ -272,14 +315,16 @@ def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
     dst = res if res_out else out
     nw = norm_w if norm_in else w
     if cfg.split > 1:
-        assert res_out and not norm_in and not glu
         _gemv_splitk_kernel[(n // cfg.bn, cfg.split)](
-            x, w, part, m, n, k,
+            x, w, part, m, n, k, nw, ssq_in, n_parts, eps,
+            NORM_IN=norm_in, GLU=glu,
             SPLIT=cfg.split, BLOCK_M=block_m, BLOCK_N=cfg.bn, BLOCK_K=cfg.bk,
+            PARTS=parts_block, SS_STRIDE=block_m,
             num_warps=cfg.warps, num_stages=cfg.stages,
         )
         _gemv_splitk_reduce_kernel[(n // cfg.bn,)](
-            part, res, ssq_out, m, n,
+            part, dst, res if res_out else dst, ssq_out, m, n,
+            GLU=glu, RES_OUT=res_out,
             SPLIT=cfg.split, BLOCK_M=block_m, BLOCK_N=cfg.bn, SS_STRIDE=block_m,
             num_warps=4,
         )
