@@ -146,6 +146,65 @@ def qkv_post(qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, T, nq, nk
     return q_out
 
 
+@triton.jit
+def _qkv_post_rows_kernel(
+    qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr,
+    q_out_ptr, k_cache_ptr, v_cache_ptr,
+    T, stride_cb, stride_ch, stride_cs, eps,
+    NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, BLOCK_HD: tl.constexpr,
+):
+    # Same arithmetic as _qkv_post_kernel, but one program handles BLOCK_HD
+    # heads of a row instead of one head, so a long prefill launches ~16x
+    # fewer (and fuller) programs.
+    row = tl.program_id(0)  # b * T + t
+    hh = tl.program_id(1) * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    b = row // T
+    t = row % T
+    pos = tl.load(pos_ptr) + t
+    d = tl.arange(0, D)
+    partner = (d + D // 2) % D
+    dt = q_out_ptr.dtype.element_ty
+    is_q = hh < NQ
+    is_k = (hh >= NQ) & (hh < NQ + NKV)
+    is_v = (hh >= NQ + NKV) & (hh < NQ + 2 * NKV)
+    h_mask = hh < NQ + 2 * NKV
+    src = qkv_ptr + row.to(tl.int64) * ((NQ + 2 * NKV) * D)
+    x = tl.load(src + hh[:, None] * D + d[None, :], mask=h_mask[:, None], other=0.0).to(tl.float32)
+    xp = tl.load(src + hh[:, None] * D + partner[None, :], mask=h_mask[:, None], other=0.0).to(tl.float32)
+    rstd = tl.math.rsqrt(tl.sum(x * x, axis=1) / D + eps)
+    wq = tl.load(qw_ptr + d).to(tl.float32)
+    wk = tl.load(kw_ptr + d).to(tl.float32)
+    wqp = tl.load(qw_ptr + partner).to(tl.float32)
+    wkp = tl.load(kw_ptr + partner).to(tl.float32)
+    w = tl.where(is_q[:, None], wq[None, :], wk[None, :])
+    wp = tl.where(is_q[:, None], wqp[None, :], wkp[None, :])
+    y = (w * (x * rstd[:, None]).to(dt).to(tl.float32)).to(dt).to(tl.float32)
+    yp = (wp * (xp * rstd[:, None]).to(dt).to(tl.float32)).to(dt).to(tl.float32)
+    rot = tl.where(d[None, :] < D // 2, -yp, yp)
+    c = tl.load(cos_ptr + pos.to(tl.int64) * D + d).to(tl.float32)
+    s = tl.load(sin_ptr + pos.to(tl.int64) * D + d).to(tl.float32)
+    out = ((y * c[None, :]).to(dt).to(tl.float32) + (rot * s[None, :]).to(dt).to(tl.float32)).to(dt)
+    tl.store(q_out_ptr + row.to(tl.int64) * (NQ * D) + hh[:, None] * D + d[None, :], out,
+             mask=is_q[:, None])
+    cache = b.to(tl.int64) * stride_cb + pos.to(tl.int64) * stride_cs + d[None, :]
+    tl.store(k_cache_ptr + cache + (hh - NQ)[:, None] * stride_ch, out, mask=is_k[:, None])
+    tl.store(v_cache_ptr + cache + (hh - NQ - NKV)[:, None] * stride_ch, x.to(dt), mask=is_v[:, None])
+
+
+def qkv_post_rows(qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, T, nq, nkv, eps):
+    """Drop-in replacement for :func:`qkv_post` (same inputs and outputs)."""
+    m = qkv.shape[0]
+    d = q_weight.shape[0]
+    block_hd = 16
+    q_out = torch.empty((m, nq * d), dtype=qkv.dtype, device=qkv.device)
+    _qkv_post_rows_kernel[(m, triton.cdiv(nq + 2 * nkv, block_hd))](
+        qkv, q_weight, k_weight, cos, sin, pos, q_out, k_cache, v_cache,
+        T, k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), eps,
+        NQ=nq, NKV=nkv, D=d, BLOCK_HD=block_hd, num_warps=4,
+    )
+    return q_out
+
+
 def _rms_ref(x, weight, eps):
     xf = x.to(torch.float32)
     variance = xf.pow(2).mean(-1, keepdim=True)
