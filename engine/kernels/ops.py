@@ -343,6 +343,19 @@ def _decode_attn_reduce_kernel(
     tl.store(dst, acc.to(out_ptr.dtype.element_ty))
 
 
+# (BLOCK_N, target programs, num_warps, num_stages) tried at warmup. At a
+# large batch x context the KV read is the whole step, so the tile shape and
+# the split count matter more than any heuristic can predict.
+ATTN_CANDIDATES = (
+    (64, 264, 4, 3),
+    (128, 264, 4, 3),
+    (64, 528, 4, 3),
+    (128, 132, 8, 3),
+    (64, 132, 4, 4),
+    (256, 264, 8, 3),
+)
+
+
 class DecodeAttention:
     """Attention of one new token per sequence over ``[0, pos[0]]`` of a
     fixed-capacity cache. The split layout depends only on batch size and
@@ -350,13 +363,16 @@ class DecodeAttention:
 
     BLOCK_N = 64
 
-    def __init__(self, batch, capacity, nq, nkv, head_dim, device, target_programs=264):
+    def __init__(self, batch, capacity, nq, nkv, head_dim, device, target_programs=264,
+                 block_n=None, num_warps=4, num_stages=3):
         self.nq, self.nkv, self.d = nq, nkv, head_dim
         self.group = nq // nkv
-        max_splits = triton.cdiv(capacity, self.BLOCK_N)
+        self.block_n = block_n or self.BLOCK_N
+        self.num_warps, self.num_stages = num_warps, num_stages
+        max_splits = triton.cdiv(capacity, self.block_n)
         want = max(1, triton.cdiv(target_programs, batch * nkv))
         splits = min(want, max_splits)
-        self.chunk = triton.cdiv(triton.cdiv(capacity, splits), self.BLOCK_N) * self.BLOCK_N
+        self.chunk = triton.cdiv(triton.cdiv(capacity, splits), self.block_n) * self.block_n
         self.splits = triton.cdiv(capacity, self.chunk)
         self.batch = batch
         self.sm_scale_log2 = (1.0 / math.sqrt(head_dim)) * 1.4426950408889634
@@ -371,8 +387,8 @@ class DecodeAttention:
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             self.chunk, self.splits, self.sm_scale_log2,
             NQ=self.nq, GROUP=self.group, D=self.d,
-            BLOCK_H=max(16, triton.next_power_of_2(self.group)), BLOCK_N=self.BLOCK_N,
-            num_warps=4,
+            BLOCK_H=max(16, triton.next_power_of_2(self.group)), BLOCK_N=self.block_n,
+            num_warps=self.num_warps, num_stages=self.num_stages,
         )
         _decode_attn_reduce_kernel[(self.batch, self.nq)](
             self.po, self.pm, self.pl, out, self.splits,
