@@ -62,13 +62,15 @@ except ImportError:  # pragma: no cover
 # Decode steps queued ahead of the one being handed to the caller. Only one
 # is queued before the first token: each graph launch costs the CPU real time
 # in the sandbox, and launches queued after a short prefill delay token 0.
-LOOKAHEAD = 2
+LOOKAHEAD = 3
 # Prefills of at most this many tokens (batch x prompt) are tried as a CUDA
 # graph at warmup and kept only if the replay beats the eager prefill. Larger
 # ones are GPU-bound anyway and their activations would sit in a graph pool.
 PREFILL_GRAPH_MAX_TOKENS = 16384
 # Largest batch the fused decode step is tried at (it is BLOCK_M of its GEMMs).
-FUSED_MAX_BATCH = 64
+# Tiles that need too much shared memory at a given BLOCK_M just fail to
+# compile during tuning and are skipped.
+FUSED_MAX_BATCH = 128
 # Warmup seconds allowed for tuning the fused step's GEMM tiles.
 TUNE_BUDGET_S = 90.0
 
@@ -137,6 +139,9 @@ class _FusedPlan:
         self.qkv = torch.empty((batch, self.n_qkv), dtype=dt, device=dev)
         self.act = torch.empty((batch, self.inter), dtype=dt, device=dev)
         self.logits = torch.empty((batch, self.vocab), dtype=dt, device=dev)
+        # FP32 slices for split-K on the residual-writing projections (N = hidden).
+        self.part = torch.empty((fused.MAX_SPLIT, self.bm, self.hidden),
+                                dtype=torch.float32, device=dev)
         self.ssq_a = torch.zeros((fused.SSQ_PARTS, self.bm), dtype=torch.float32, device=dev)
         self.ssq_b = torch.zeros_like(self.ssq_a)
         self.cfg = {}
@@ -447,11 +452,11 @@ class Engine:
             a = fused.attention_fused(st.attn, f.qkv, layer.q_norm, layer.k_norm, self.cos,
                                       self.sin, st.pos, st.k_cache[i], st.v_cache[i], eps)
             fused.gemv(a, layer.o, None, m, hid, f.k_o, c["o"], bm, b_buf, a_buf, eps, res=f.h,
-                       parts_block=pp)
+                       parts_block=pp, part=f.part)
             fused.gemv(f.h, layer.gate_up, f.act, m, f.inter, hid, c["gate_up"], bm, a_buf, b_buf,
                        eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True, parts_block=pb)
             fused.gemv(f.act, layer.down, None, m, hid, f.inter, c["down"], bm, a_buf, b_buf, eps,
-                       res=f.h, parts_block=pp)
+                       res=f.h, parts_block=pp, part=f.part)
             parts = f.parts_down
         fused.gemv(f.h, self.lm_w, f.logits, m, f.vocab, hid, c["lm"], bm, b_buf, a_buf, eps,
                    norm_w=self.norm_w, n_parts=parts, parts_block=pb)
@@ -484,9 +489,12 @@ class Engine:
         norm_w = self._role_norm(role) if norm else None
         weights = self._role_weights(role)
         parts_block = plan.parts_for(role)
+        # Split-K needs N == hidden (the partial buffer's width) and the
+        # RES_OUT epilogue, which is exactly the producer roles.
+        split_ok = role in plan.PRODUCERS and n == plan.hidden
         timings = []
-        for cfg in fused.candidates(m):
-            if n % cfg.bn or k % cfg.bk:
+        for cfg in fused.candidates(m, split_ok):
+            if n % cfg.bn or k % (cfg.bk * cfg.split) or cfg.bn > n:
                 continue
             if timings and time.perf_counter() > deadline:
                 break
@@ -495,7 +503,7 @@ class Engine:
                 for w in weights:
                     fused.gemv(x, w, None if res else out, m, n, k, cfg, bm, ssq_in, ssq_out,
                                self.eps, norm_w=norm_w, n_parts=1, res=res_buf, glu=glu,
-                               parts_block=parts_block)
+                               parts_block=parts_block, part=plan.part)
 
             graph = None
             try:
@@ -571,9 +579,11 @@ class Engine:
         start = time.perf_counter()
         plan = _FusedPlan(self, st.batch)
         st.fused = plan
-        deadline = start + TUNE_BUDGET_S
-        for role in plan.ROLES:
-            plan.cfg[role] = self._tune_gemv(plan, role, deadline)
+        # One slice of the budget per role, so the first roles cannot starve
+        # the last ones; unused time carries forward.
+        slice_s = TUNE_BUDGET_S / len(plan.ROLES)
+        for i, role in enumerate(plan.ROLES):
+            plan.cfg[role] = self._tune_gemv(plan, role, start + slice_s * (i + 1))
             if role == "down":
                 plan.parts_o = plan.hidden // plan.cfg["o"].bn
                 plan.parts_down = plan.hidden // plan.cfg["down"].bn
