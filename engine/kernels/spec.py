@@ -37,6 +37,7 @@ import triton.language as tl
 def _ngram_draft_kernel(
     hist_ptr, lens_ptr, ids_ptr, draft_ptr, cap,
     NGRAM: tl.constexpr, K: tl.constexpr, T: tl.constexpr, BLOCK: tl.constexpr,
+    CAP: tl.constexpr,
 ):
     # History of sequence b is hist[b, 0 .. L] inclusive: L = lens[b] slots
     # are in the KV cache and hist[b, L] is the token not yet fed (the one
@@ -51,7 +52,12 @@ def _ngram_draft_kernel(
     # recent match, which is the better predictor in practice.
     best = -1
     limit = L - NGRAM + 1  # j must leave a following token at j+NGRAM <= L
-    for j0 in range(0, limit, BLOCK):
+    # ``L`` varies between sequences after the first speculative iteration.
+    # Keep the loop bound a compile-time capacity instead of using a runtime
+    # Python-range endpoint: Triton 3.1 can then compile one stable graph
+    # specialization for the shape, and the mask excludes both unwritten
+    # cache slots and positions beyond this sequence's valid history.
+    for j0 in range(0, CAP, BLOCK):
         offs = j0 + tl.arange(0, BLOCK)
         ok = offs < limit
         for i in tl.static_range(NGRAM):
@@ -78,7 +84,7 @@ def ngram_draft(hist, lens, ids, draft, ngram, k, t):
     batch, cap = hist.shape
     _ngram_draft_kernel[(batch,)](
         hist, lens, ids, draft, cap,
-        NGRAM=ngram, K=k, T=t, BLOCK=1024, num_warps=4,
+        NGRAM=ngram, K=k, T=t, BLOCK=1024, CAP=cap, num_warps=4,
     )
 
 
@@ -87,7 +93,7 @@ def _spec_attn_kernel(
     q_ptr, k_ptr, v_ptr, lens_ptr, out_ptr,
     stride_cb, stride_ch, stride_cs, sm_scale_log2,
     T: tl.constexpr, NQ: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
-    BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr, CAP: tl.constexpr,
 ):
     # One program per (sequence, kv head), BLOCK_R rows = T queries x GROUP
     # q heads. Query row t sees cache slots 0 .. L+t: the prefix plus the
@@ -114,7 +120,11 @@ def _spec_attn_kernel(
     l_i = tl.zeros([BLOCK_R], dtype=tl.float32)
     acc = tl.zeros([BLOCK_R, D], dtype=tl.float32)
     end = L + T
-    for n0 in range(0, end, BLOCK_N):
+    # As with the draft lookup, lengths vary across sequences.  A
+    # capacity-specialized loop is graph-safe on Triton 3.1; masked tail
+    # blocks are mathematically empty and do not expose unwritten cache
+    # entries to the softmax.
+    for n0 in range(0, CAP, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
         kv_off = base + offs_n[:, None].to(tl.int64) * stride_cs + offs_d[None, :]
         k = tl.load(k_ptr + kv_off, mask=(offs_n < end)[:, None], other=0.0)
@@ -146,6 +156,7 @@ def spec_attention(q, k_cache, v_cache, lens, batch, t, nq, nkv, head_dim, sm_sc
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), sm_scale_log2,
         T=t, NQ=nq, GROUP=group, D=head_dim,
         BLOCK_R=max(16, triton.next_power_of_2(t * group)), BLOCK_N=block_n,
+        CAP=k_cache.shape[2],
         num_warps=num_warps, num_stages=num_stages,
     )
     return out

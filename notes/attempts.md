@@ -14,7 +14,7 @@ workloads. Fill in the numbers from the run page.
 | 6+7 | 6505b80 | v6 single-split attention + v7 split-8/argmax + cold-KV tuner fix | 888.2 | yes | run b54796c8; B16 best yet (715.8 ms), B1/B4 -2% |
 | 8 | cd5ef7c | v8: noise-robust tuner decisions (3% margin, min-of-rounds) | **902.9** | yes | run 84daa14e, **best so far, #22**; all three public shapes improved together |
 | 9 | 31212d0 | v9: split-K for every projection but the LM head | 883.6 | yes | run 881e52fa; ~2% down everywhere incl. untouched TTFT -> slower machine instance |
-| 10 | _tbd_ | v10: speculative decoding (n-gram drafts, exact verification) | | | |
+| 10 | _tbd_ | v10: widened exact speculative verification (n-gram drafts) | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -367,9 +367,11 @@ only lever that changes tokens per weight-stream.
 
 - `kernels/spec.py`: draft, verify, accept.
   - **draft**: the last NGRAM=2 tokens of a sequence's own history, matched
-    against that history, most recent match wins, K=3 following tokens
-    copied. Runs on device from a history buffer, so the whole iteration is
-    still one graph replay.
+    against that history, most recent match wins, K=7 following tokens
+    copied. Verification permits up to 256 rows (`batch * (K + 1)`), rather
+    than being limited by the 128-row ordinary-decode specialization. Runs on
+    device from a history buffer, so the whole iteration is still one graph
+    replay.
   - **verify**: the *fused decode step* over T=K+1 rows per sequence, not a
     prefill-shaped path. That is the crux: prefill-shaped verification costs
     ~1.4x a step and eats the entire gain, while the fused path at M=batch*T
@@ -381,6 +383,10 @@ only lever that changes tokens per weight-stream.
 - Per-sequence positions throughout (`lens` vector, not a scalar): sequences
   accept different amounts, so `qkv_post_rows` gained a PER_SEQ mode and the
   attention kernel takes per-sequence lengths with row-dependent masking.
+- The n-gram and multi-token attention loops are capacity-specialized and
+  masked. This avoids runtime-range graph specializations when accepted lengths
+  diverge across sequences; the extra masked tail blocks are not visible to
+  attention or softmax.
 - Gating, in three layers:
   1. `_check_spec` replays the speculative output through the plain step
      teacher-forced - the judge's own test, locally - and rejects on any

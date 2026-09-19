@@ -72,10 +72,20 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
 FUSED_MAX_BATCH = 128
-# Speculative decoding: draft length, n-gram order for the lookup, and the
-# net speedup (measured on the judge's own warmup prompt) below which it is
-# switched off for the samples.
-SPEC_K = 3
+# Speculative decoding deliberately has a larger row budget than ordinary
+# decode.  Verification amortises one full weight stream over B * (K + 1)
+# rows, so its useful operating point is wider than the B-row decode kernel.
+# If a wide specialization cannot compile or does not repay its cost on the
+# workload's warmup prompt, the existing exact gate leaves speculation off.
+SPEC_MAX_ROWS = 256
+# A three-token draft was too short to expose the only super-linear lever in
+# this benchmark: several exact output tokens from one target-model pass.
+# Seven is still small enough that verification fits the static cache and the
+# fused plan at the public shapes, while the warmup net-gain test prevents it
+# from hurting prompts with no useful repetition.
+SPEC_K = 7
+# N-gram order for the lookup, and the net speedup (measured on the judge's
+# own warmup prompt) below which speculation is switched off for the samples.
 SPEC_NGRAM = 2
 SPEC_MIN_NET_GAIN = 1.05
 SPEC_TUNE_BUDGET_S = 25.0
@@ -961,9 +971,12 @@ class Engine:
         self.state = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-        # A speculative iteration feeds T = k+1 rows per sequence, so the
-        # fused GEMMs run at batch * T rows; keep that inside the tile limit.
-        spec_k = min(SPEC_K, max(0, FUSED_MAX_BATCH // max(batch, 1) - 1))
+        # A speculative iteration feeds T = k+1 rows per sequence.  This is
+        # intentionally allowed to be wider than ordinary decode: more rows
+        # improve reuse of each target weight read during exact verification.
+        # The plan is still independently compiled, checked and cost-gated;
+        # an unsupported specialization simply falls back to plain decode.
+        spec_k = min(SPEC_K, max(0, SPEC_MAX_ROWS // max(batch, 1) - 1))
         spec_ok = (self.fused_ok and self.use_graphs and new_tokens > 1 and spec_k >= 1)
         # Pad by 2T, not T: the iteration that finishes a sequence can push
         # its length to stop_len + k, and that sequence is still fed once
