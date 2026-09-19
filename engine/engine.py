@@ -4,7 +4,10 @@ What this changes relative to the Transformers baseline, and what it keeps:
 
 * Weights are the loaded module's own tensors; Q/K/V and gate/up are packed
   into one matrix each so a layer issues fewer, larger GEMMs.
-* Prefill runs eagerly and uses FlashAttention like the baseline, but passes
+* Prefill (up to PREFILL_GRAPH_MAX_TOKENS tokens) is also a CUDA graph over
+  a static prompt buffer, so a short prompt costs one launch instead of ~430;
+  longer prefills stay eager because they are bound by GPU work.
+* Prefill uses FlashAttention like the baseline, but passes
   the 8 KV heads directly (``enable_gqa``) instead of materialising 32
   expanded copies; it falls back to the baseline's expanded call if that
   path is unavailable or disagrees at load time.
@@ -56,8 +59,14 @@ try:  # PyTorch >= 2.3
 except ImportError:  # pragma: no cover
     SDPBackend = sdpa_kernel = None
 
-# Decode steps queued ahead of the one being handed to the caller.
-LOOKAHEAD = 3
+# Decode steps queued ahead of the one being handed to the caller. Only one
+# is queued before the first token: each graph launch costs the CPU real time
+# in the sandbox, and launches queued after a short prefill delay token 0.
+LOOKAHEAD = 2
+# Prefills of at most this many tokens (batch x prompt) are tried as a CUDA
+# graph at warmup and kept only if the replay beats the eager prefill. Larger
+# ones are GPU-bound anyway and their activations would sit in a graph pool.
+PREFILL_GRAPH_MAX_TOKENS = 16384
 # Largest batch the fused decode step is tried at (it is BLOCK_M of its GEMMs).
 FUSED_MAX_BATCH = 64
 # Warmup seconds allowed for tuning the fused step's GEMM tiles.
@@ -100,13 +109,19 @@ class _ShapeState:
         self.events = [torch.cuda.Event() for _ in range(new_tokens)] if on_cuda else None
         self.graph = None
         self.step = engine._decode_step  # eager step (fallback / capture source)
+        self.prefill_graph = None
+        self.prefill_ids = None
+        self.prefill_out = None
         self.fused = None  # _FusedPlan when the fused step is in use
 
 
 class _FusedPlan:
     """Static buffers and tuned tile configs for the fused decode step."""
 
-    ROLES = ("qkv", "o", "gate_up", "down", "lm")
+    # Producers (O, down) first: their tile width fixes how many partial sums
+    # of squares the norm-in consumers read.
+    ROLES = ("o", "down", "qkv", "gate_up", "lm")
+    PRODUCERS = ("o", "down")
 
     def __init__(self, engine, batch):
         dev, dt = engine.device, engine.dtype
@@ -126,6 +141,10 @@ class _FusedPlan:
         self.ssq_b = torch.zeros_like(self.ssq_a)
         self.cfg = {}
         self.parts_o = self.parts_down = 0
+        self.parts_block = fused.SSQ_PARTS
+
+    def parts_for(self, role):
+        return fused.SSQ_PARTS if role in self.PRODUCERS else self.parts_block
 
     def dims(self, role):
         """(n, k, norm, glu, res) of one projection role."""
@@ -418,22 +437,24 @@ class Engine:
         squares that the next RMSNorm needs (a after O, b after down/embed)."""
         f = st.fused
         m, bm, c, eps, hid = f.m, f.bm, f.cfg, self.eps, f.hidden
+        pb, pp = f.parts_block, fused.SSQ_PARTS  # consumers / producers
         a_buf, b_buf = f.ssq_a, f.ssq_b
         fused.embed_ssq(st.ids, self.embed_w, f.h, b_buf)
         parts = 1
         for i, layer in enumerate(self.layers):
             fused.gemv(f.h, layer.qkv, f.qkv, m, f.n_qkv, hid, c["qkv"], bm, b_buf, a_buf, eps,
-                       norm_w=layer.in_w, n_parts=parts)
+                       norm_w=layer.in_w, n_parts=parts, parts_block=pb)
             a = fused.attention_fused(st.attn, f.qkv, layer.q_norm, layer.k_norm, self.cos,
                                       self.sin, st.pos, st.k_cache[i], st.v_cache[i], eps)
-            fused.gemv(a, layer.o, None, m, hid, f.k_o, c["o"], bm, b_buf, a_buf, eps, res=f.h)
+            fused.gemv(a, layer.o, None, m, hid, f.k_o, c["o"], bm, b_buf, a_buf, eps, res=f.h,
+                       parts_block=pp)
             fused.gemv(f.h, layer.gate_up, f.act, m, f.inter, hid, c["gate_up"], bm, a_buf, b_buf,
-                       eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True)
+                       eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True, parts_block=pb)
             fused.gemv(f.act, layer.down, None, m, hid, f.inter, c["down"], bm, a_buf, b_buf, eps,
-                       res=f.h)
+                       res=f.h, parts_block=pp)
             parts = f.parts_down
         fused.gemv(f.h, self.lm_w, f.logits, m, f.vocab, hid, c["lm"], bm, b_buf, a_buf, eps,
-                   norm_w=self.norm_w, n_parts=parts)
+                   norm_w=self.norm_w, n_parts=parts, parts_block=pb)
         st.ids.copy_(torch.argmax(f.logits, dim=-1))
         st.pos.add_(1)
         return f.logits
@@ -462,8 +483,9 @@ class Engine:
         ssq_out = torch.zeros_like(ssq_in)
         norm_w = self._role_norm(role) if norm else None
         weights = self._role_weights(role)
+        parts_block = plan.parts_for(role)
         timings = []
-        for cfg in fused.GEMV_CANDIDATES:
+        for cfg in fused.candidates(m):
             if n % cfg.bn or k % cfg.bk:
                 continue
             if timings and time.perf_counter() > deadline:
@@ -472,7 +494,8 @@ class Engine:
             def run():
                 for w in weights:
                     fused.gemv(x, w, None if res else out, m, n, k, cfg, bm, ssq_in, ssq_out,
-                               self.eps, norm_w=norm_w, n_parts=1, res=res_buf, glu=glu)
+                               self.eps, norm_w=norm_w, n_parts=1, res=res_buf, glu=glu,
+                               parts_block=parts_block)
 
             graph = None
             try:
@@ -551,8 +574,11 @@ class Engine:
         deadline = start + TUNE_BUDGET_S
         for role in plan.ROLES:
             plan.cfg[role] = self._tune_gemv(plan, role, deadline)
-        plan.parts_o = plan.hidden // plan.cfg["o"].bn
-        plan.parts_down = plan.hidden // plan.cfg["down"].bn
+            if role == "down":
+                plan.parts_o = plan.hidden // plan.cfg["o"].bn
+                plan.parts_down = plan.hidden // plan.cfg["down"].bn
+                most = max(plan.parts_o, plan.parts_down)
+                plan.parts_block = max(2, 1 << (most - 1).bit_length())
         ok, detail = self._check_fused(st, prompt_len, new_tokens)
         _log(f"fused step vs v1: {detail} -> {'ok' if ok else 'REJECTED'}")
         if not ok:
@@ -601,12 +627,64 @@ class Engine:
                     _log(f"fused step unavailable: {type(exc).__name__}: {str(exc)[:300]}")
                     st.fused = None
                     st.step = self._decode_step
+        if self.use_graphs and batch * prompt_len <= PREFILL_GRAPH_MAX_TOKENS:
+            try:
+                self._capture_prefill(st, batch, prompt_len)
+            except Exception as exc:
+                torch.cuda.synchronize()
+                st.prefill_graph = None
+                _log(f"prefill graph unavailable: {type(exc).__name__}: {str(exc)[:200]}")
         self.state = st
         _log(f"shape B={batch} S={prompt_len} N={new_tokens}: capacity {st.capacity}, "
              f"{st.attn.splits} attention splits, graph={'yes' if st.graph else 'no'}, "
+             f"prefill_graph={'yes' if st.prefill_graph else 'no'}, "
              f"step={'fused' if st.fused is not None else 'v1'}, "
              f"setup {time.perf_counter() - start:.2f}s")
         return st
+
+    def _capture_prefill(self, st, batch, prompt_len):
+        """Try replacing the prefill's ~430 launches with one graph replay.
+
+        Only the prompt ids change between calls, so they live in a static
+        buffer and the graph writes the first token into ``st.prefill_out``.
+        A short prefill is bound by launch overhead and wins; a long one is
+        bound by GPU work, so the graph is dropped again rather than holding
+        its activations in a permanent pool. Wall clock, not events: the cost
+        being measured is partly the host's."""
+        start = time.perf_counter()
+        st.prefill_ids = torch.zeros((batch, prompt_len), dtype=torch.int64, device=self.device)
+
+        def timed(run):
+            best = float("inf")
+            for _ in range(2):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                run()
+                torch.cuda.synchronize()
+                best = min(best, (time.perf_counter() - t0) * 1e3)
+            return best
+
+        t_eager = timed(lambda: self._prefill(st, st.prefill_ids))
+        torch.cuda.empty_cache()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            self._prefill(st, st.prefill_ids)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            st.prefill_out = self._prefill(st, st.prefill_ids)
+        torch.cuda.synchronize()
+        t_graph = timed(graph.replay)
+        keep = t_graph < t_eager
+        _log(f"prefill: eager {t_eager:.2f} ms, graph {t_graph:.2f} ms -> "
+             f"{'graph' if keep else 'eager'} (setup {time.perf_counter() - start:.1f}s)")
+        if keep:
+            st.prefill_graph = graph
+        else:
+            st.prefill_out = None
+            del graph
+            torch.cuda.empty_cache()
 
     def _capture(self, st, step):
         # Warm on a side stream (compiles kernels, creates cuBLAS handles),
@@ -654,23 +732,29 @@ class Engine:
         if steps <= 0:
             return
         with torch.inference_mode():
-            ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
+            ids = torch.tensor(input_ids, dtype=torch.int64)
             batch, prompt_len = ids.shape
             st = self._state_for(batch, prompt_len, steps)
             # Everything prompt-dependent is rewritten here: cache slots
             # [0, S) by prefill, then S onwards one step at a time; attention
             # never reads past the current position. The fused step's
             # residual and norm buffers are rebuilt from the token each step.
-            st.ids.copy_(self._prefill(st, ids))
+            if st.prefill_graph is not None:
+                st.prefill_ids.copy_(ids)
+                st.prefill_graph.replay()
+                st.ids.copy_(st.prefill_out)
+            else:
+                st.ids.copy_(self._prefill(st, ids.to(self.device, non_blocking=True)))
             st.pos.fill_(prompt_len)
             self._publish(st, 0)
-        # Keep the GPU LOOKAHEAD steps ahead of the caller: each step's graph
-        # reads the token the previous one wrote on the device, and its copy
-        # to the host is queued right behind it.
+        # Keep the GPU ahead of the caller: each step's graph reads the token
+        # the previous one wrote on the device, and its copy to the host is
+        # queued right behind it. Before the first token only one step is
+        # queued, so launch time cannot push out TTFT.
         ahead = LOOKAHEAD if st.graph is not None else 1
         launched = 1
         for step in range(steps):
-            target = min(steps, step + 1 + ahead)
+            target = min(steps, step + 1 + (1 if step == 0 else ahead))
             if launched < target:
                 with torch.inference_mode():
                     while launched < target:
