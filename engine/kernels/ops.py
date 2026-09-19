@@ -274,10 +274,10 @@ def silu_mul_ref(gate_up):
 
 @triton.jit
 def _decode_attn_split_kernel(
-    q_ptr, k_ptr, v_ptr, pos_ptr, po_ptr, pm_ptr, pl_ptr,
+    q_ptr, k_ptr, v_ptr, pos_ptr, po_ptr, pm_ptr, pl_ptr, out_ptr,
     stride_cb, stride_ch, stride_cs, chunk, num_splits, sm_scale_log2,
     NQ: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, ONE_SPLIT: tl.constexpr,
 ):
     b = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -315,10 +315,17 @@ def _decode_attn_split_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
-    part = (b * NQ + heads).to(tl.int64) * num_splits + split
-    tl.store(po_ptr + part[:, None] * D + offs_d[None, :], acc, mask=h_mask[:, None])
-    tl.store(pm_ptr + part, m_i, mask=h_mask)
-    tl.store(pl_ptr + part, l_i, mask=h_mask)
+    if ONE_SPLIT:
+        # The only split spans the whole sequence, so the reduce kernel would
+        # just divide by l_i: do it here and skip that launch.
+        o = (acc / l_i[:, None]).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + b.to(tl.int64) * (NQ * D) + heads[:, None] * D + offs_d[None, :], o,
+                 mask=h_mask[:, None])
+    else:
+        part = (b * NQ + heads).to(tl.int64) * num_splits + split
+        tl.store(po_ptr + part[:, None] * D + offs_d[None, :], acc, mask=h_mask[:, None])
+        tl.store(pm_ptr + part, m_i, mask=h_mask)
+        tl.store(pl_ptr + part, l_i, mask=h_mask)
 
 
 @triton.jit
@@ -353,6 +360,11 @@ ATTN_CANDIDATES = (
     (128, 132, 8, 3),
     (64, 132, 4, 4),
     (256, 264, 8, 3),
+    # target 1 forces a single split, which skips the reduce launch entirely
+    # (36 fewer kernels per step); worth it once batch * kv heads fills the
+    # device on its own.
+    (64, 1, 4, 3),
+    (128, 1, 8, 3),
 )
 
 
@@ -382,19 +394,21 @@ class DecodeAttention:
 
     def __call__(self, q, k_cache, v_cache, pos):
         out = torch.empty((self.batch, self.nq * self.d), dtype=q.dtype, device=q.device)
+        one = self.splits == 1
         _decode_attn_split_kernel[(self.batch, self.nkv, self.splits)](
-            q, k_cache, v_cache, pos, self.po, self.pm, self.pl,
+            q, k_cache, v_cache, pos, self.po, self.pm, self.pl, out,
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             self.chunk, self.splits, self.sm_scale_log2,
             NQ=self.nq, GROUP=self.group, D=self.d,
             BLOCK_H=max(16, triton.next_power_of_2(self.group)), BLOCK_N=self.block_n,
-            num_warps=self.num_warps, num_stages=self.num_stages,
+            ONE_SPLIT=one, num_warps=self.num_warps, num_stages=self.num_stages,
         )
-        _decode_attn_reduce_kernel[(self.batch, self.nq)](
-            self.po, self.pm, self.pl, out, self.splits,
-            NQ=self.nq, D=self.d, SPLITS=max(2, triton.next_power_of_2(self.splits)),
-            num_warps=4,
-        )
+        if not one:
+            _decode_attn_reduce_kernel[(self.batch, self.nq)](
+                self.po, self.pm, self.pl, out, self.splits,
+                NQ=self.nq, D=self.d, SPLITS=max(2, triton.next_power_of_2(self.splits)),
+                num_warps=4,
+            )
         return out
 
 

@@ -10,7 +10,8 @@ workloads. Fill in the numbers from the run page.
 | 2 | daedece | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | 882.2 | yes | official run 4e9a638e, +3.1% over v1 |
 | 3 | 94660b0 | v3: prefill CUDA graph (raced), single-row GEMV for B1, lookahead 1 before first token | 882.7 | yes | official run 3bdf08de; B1 +13% but score flat -> hidden shapes are not batch 1 |
 | 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | 894.5 | yes | run a93ebf2b, +1.3%; TPOT down at every public shape |
-| 5 | _tbd_ | v5: decode attention tile/split tuned at warmup | | | |
+| 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | | | run b4494a7a |
+| 6 | _tbd_ | v6: single-split attention writes its output directly (no reduce launch) | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -207,3 +208,16 @@ roughly 55% of peak bandwidth. cuBLAS (v1) was no better, which points at a
 structural cause rather than a bad kernel: ~220 launches per step, each
 kernel short enough (9-30 us) that wave fill and drain are a large fraction
 of it. That makes kernel count, not arithmetic, the thing to attack next.
+
+## v6 changes
+
+- Both decode attention kernels take an `ONE_SPLIT` flag: with one split the
+  program already holds the whole sequence's running softmax, so it divides
+  by l_i and stores the output itself. The reduce kernel is then not launched
+  at all: 36 fewer launches per step. Identical arithmetic (with one split the
+  reduce's weights are exactly 1).
+- Two candidates with target_programs=1 added, so the tuner can pick a single
+  split when batch * kv_heads already fills the device.
+- Motivation from run 4: decode streams at ~55% of peak bandwidth and cuBLAS
+  was no better, so the limit looks structural - ~220 short launches per step,
+  each paying wave fill/drain. Cutting launches is the lever.
