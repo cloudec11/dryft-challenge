@@ -12,6 +12,7 @@ workloads. Fill in the numbers from the run page.
 | 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | 894.5 | yes | run a93ebf2b, +1.3%; TPOT down at every public shape |
 | 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | | | run b4494a7a |
 | 6 | _tbd_ | v6: single-split attention writes its output directly (no reduce launch) | | | |
+| 7 | _tbd_ | v7: split-8 GEMV candidates, argmax writes the id buffer in place | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -221,3 +222,11 @@ of it. That makes kernel count, not arithmetic, the thing to attack next.
 - Motivation from run 4: decode streams at ~55% of peak bandwidth and cuBLAS
   was no better, so the limit looks structural - ~220 short launches per step,
   each paying wave fill/drain. Cutting launches is the lever.
+
+## v7 changes
+
+- Split-K candidates up to 8 slices (MAX_SPLIT 8): for the O projection
+  (K=4096) that is 8 x 512 columns per slice, 320 programs at BLOCK_N 64.
+  The tuner skips any slice count that does not divide K by BLOCK_K.
+- `torch.argmax(..., out=ids)` instead of argmax-then-copy: one less launch
+  per step, probed once at load so an unsupported out= cannot break capture.

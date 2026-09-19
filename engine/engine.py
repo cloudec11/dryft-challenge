@@ -251,6 +251,14 @@ class Engine:
         self.use_triton_attn = False
         self.prefill_gqa = False
         self.fused_ok = use_triton and self.device.type == "cuda"
+        # argmax straight into the id buffer saves a copy launch per step;
+        # probe it once rather than trusting the runtime's out= support.
+        self.argmax_out = True
+        try:
+            probe = torch.empty((1,), dtype=torch.int64, device=self.device)
+            torch.argmax(torch.zeros((1, 2), device=self.device), dim=-1, out=probe)
+        except Exception:
+            self.argmax_out = False
         chosen = {}
         if self.device.type == "cuda":
             try:
@@ -419,6 +427,14 @@ class Engine:
         last = n.view(batch, T, -1)[:, -1, :]
         return torch.argmax(F.linear(last, self.lm_w), dim=-1)
 
+    def _argmax_into(self, logits, ids):
+        """Greedy pick, writing the id buffer in place (ties to the lowest
+        index, as torch.argmax does)."""
+        if self.argmax_out:
+            torch.argmax(logits, dim=-1, out=ids)
+        else:
+            ids.copy_(torch.argmax(logits, dim=-1))
+
     def _decode_step(self, st):
         """v1: one token per sequence at position ``st.pos``; graph-capturable.
         Returns the step's logits."""
@@ -432,7 +448,7 @@ class Engine:
         x = F.embedding(st.ids, self.embed_w)
         n = self._layers_forward(x, 1, st.pos, st.k_cache, st.v_cache, attend)
         logits = F.linear(n, self.lm_w)
-        st.ids.copy_(torch.argmax(logits, dim=-1))
+        self._argmax_into(logits, st.ids)
         st.pos.add_(1)
         return logits
 
@@ -462,7 +478,7 @@ class Engine:
             parts = f.parts_down
         fused.gemv(f.h, self.lm_w, f.logits, m, f.vocab, hid, c["lm"], bm, b_buf, a_buf, eps,
                    norm_w=self.norm_w, n_parts=parts, parts_block=pb)
-        st.ids.copy_(torch.argmax(f.logits, dim=-1))
+        self._argmax_into(f.logits, st.ids)
         st.pos.add_(1)
         return f.logits
 

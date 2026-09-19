@@ -150,7 +150,7 @@ def _gemv_vec_kernel(
         tl.store(out_ptr + offs_n, y.to(dt))
 
 
-MAX_SPLIT = 4  # rows of the FP32 partial buffer a split-K projection needs
+MAX_SPLIT = 8  # rows of the FP32 partial buffer a split-K projection needs
 
 
 @triton.jit
@@ -246,6 +246,8 @@ GEMV_SPLITK_CANDIDATES = (
     GemvConfig(64, 128, 4, 4, split=4),
     GemvConfig(32, 128, 4, 4, split=4),
     GemvConfig(128, 128, 3, 8, split=2),
+    GemvConfig(64, 128, 4, 4, split=8),
+    GemvConfig(32, 128, 4, 4, split=8),
 )
 
 
