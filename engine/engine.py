@@ -28,6 +28,7 @@ What this changes relative to the Transformers baseline, and what it keeps:
   at load time and replaced by the twin if it disagrees or fails to compile.
 """
 
+import collections
 import os
 import sys
 import tempfile
@@ -52,7 +53,7 @@ _ensure_triton_cache()
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from kernels import fused, ops  # noqa: E402
+from kernels import fused, ops, spec  # noqa: E402
 
 try:  # PyTorch >= 2.3
     from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
@@ -71,10 +72,17 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
 FUSED_MAX_BATCH = 128
+# Speculative decoding: draft length, n-gram order for the lookup, and the
+# net speedup (measured on the judge's own warmup prompt) below which it is
+# switched off for the samples.
+SPEC_K = 3
+SPEC_NGRAM = 2
+SPEC_MIN_NET_GAIN = 1.05
+SPEC_TUNE_BUDGET_S = 25.0
 # Warmup seconds allowed for tuning the fused step's GEMM tiles, and for the
 # decode attention tile shape.
-TUNE_BUDGET_S = 90.0
-ATTN_TUNE_BUDGET_S = 25.0
+TUNE_BUDGET_S = 55.0
+ATTN_TUNE_BUDGET_S = 15.0
 # A later candidate has to win by this much to displace an earlier one. Runs
 # vary by ~1-2% on identical code, so picking the bare minimum of a set of
 # noisy measurements is how a tuner talks itself into a worse configuration;
@@ -98,11 +106,15 @@ class _Layer:
 class _ShapeState:
     """Buffers and the captured graph for one (batch, prompt, output) shape."""
 
-    def __init__(self, engine, batch, prompt_len, new_tokens):
+    def __init__(self, engine, batch, prompt_len, new_tokens, pad=0):
         dev, dt = engine.device, engine.dtype
         self.key = (batch, prompt_len, new_tokens)
         self.batch = batch
-        self.capacity = prompt_len + new_tokens
+        self.prompt_len = prompt_len
+        self.new_tokens = new_tokens
+        # pad: a speculative iteration writes T slots from a sequence's
+        # current length, and the last one may start at the final length.
+        self.capacity = prompt_len + new_tokens + pad
         shape = (engine.n_layers, batch, engine.nkv, self.capacity, engine.head_dim)
         # Zeroed once so the reference attention (which masks scores over the
         # full capacity) never multiplies a zero probability by NaN garbage.
@@ -118,6 +130,8 @@ class _ShapeState:
         self.events = [torch.cuda.Event() for _ in range(new_tokens)] if on_cuda else None
         self.graph = None
         self.step = engine._decode_step  # eager step (fallback / capture source)
+        self.spec = None
+        self.spec_on = None  # None until the warmup call measures acceptance
         self.prefill_graph = None
         self.prefill_ids = None
         self.prefill_out = None
@@ -168,6 +182,36 @@ class _FusedPlan:
             "down": (self.hidden, self.inter, False, False, True),
             "lm": (self.vocab, self.hidden, True, False, False),
         }[role]
+
+
+class _SpecPlan:
+    """Buffers for speculative decoding at one shape.
+
+    ``fused`` is an ordinary fused-decode plan sized for B*T rows: the verify
+    forward is the same step, just with T rows per sequence, which is why
+    verification costs ~1.1x a single-token step instead of the ~1.4x a
+    prefill-shaped path would."""
+
+    def __init__(self, engine, st, k, ngram):
+        dev = engine.device
+        batch = st.batch
+        self.k = k
+        self.ngram = ngram
+        self.t = k + 1
+        self.rows = batch * self.t
+        self.fused = _FusedPlan(engine, self.rows)
+        self.hist = torch.zeros((batch, st.capacity), dtype=torch.int64, device=dev)
+        self.lens = torch.zeros((batch,), dtype=torch.int32, device=dev)
+        self.draft = torch.zeros((batch, k), dtype=torch.int64, device=dev)
+        self.ids = torch.zeros((self.rows,), dtype=torch.int64, device=dev)
+        self.out_tok = torch.zeros((self.rows,), dtype=torch.int64, device=dev)
+        self.naccept = torch.zeros((batch,), dtype=torch.int32, device=dev)
+        self.host_tok = torch.empty((self.rows,), dtype=torch.int64, pin_memory=True)
+        self.host_acc = torch.empty((batch,), dtype=torch.int32, pin_memory=True)
+        self.event = torch.cuda.Event()
+        self.graph = None
+        self.stop_len = 0
+        self.cost = 1.0  # iteration time relative to a plain decode step
 
 
 class Engine:
@@ -500,7 +544,7 @@ class Engine:
         return {"qkv": self.layers[0].in_w, "gate_up": self.layers[0].post_w,
                 "lm": self.norm_w}.get(role)
 
-    def _tune_gemv(self, plan, role, deadline):
+    def _tune_gemv(self, plan, role, deadline, limit=None):
         """Time every candidate tile over all 36 layers' weights (so nothing
         sits in L2) inside a CUDA graph; return the fastest that runs."""
         n, k, norm, glu, res = plan.dims(role)
@@ -517,7 +561,13 @@ class Engine:
         # for the widest of them.
         split_ok = role != "lm" and n <= plan.inter
         timings = []
-        for cfg in fused.candidates(m, split_ok, split_first=role in plan.PRODUCERS):
+        cands = fused.candidates(m, split_ok, split_first=role in plan.PRODUCERS)
+        # Filter on shared memory before spending a compile on a tile that
+        # cannot fit: at BLOCK_M 128 (speculative verification runs batch*T
+        # rows) the widest tiles need 300 KB of the 227 KB an H100 SM has.
+        cands = [c for c in cands
+                 if fused.smem_bytes(c, bm, glu) <= 200 * 1024 or c.vec]
+        for cfg in (cands[:limit] if limit else cands):
             if n % cfg.bn or k % (cfg.bk * cfg.split) or cfg.bn > n:
                 continue
             if timings and time.perf_counter() > deadline:
@@ -721,6 +771,186 @@ class Engine:
         else:
             st.fused = None
 
+    # -------------------------------------------------------- speculation
+
+    def _spec_step(self, st):
+        """One speculative iteration: draft, verify T rows per sequence,
+        accept. Every shape is static, so this captures into one graph."""
+        sp = st.spec
+        f = sp.fused
+        rows, bm, c, eps, hid = sp.rows, f.bm, f.cfg, self.eps, f.hidden
+        pb, pp = f.parts_block, fused.SSQ_PARTS
+        a_buf, b_buf = f.ssq_a, f.ssq_b
+        spec.ngram_draft(sp.hist, sp.lens, sp.ids, sp.draft, sp.ngram, sp.k, sp.t)
+        fused.embed_ssq(sp.ids, self.embed_w, f.h, b_buf)
+        parts = 1
+        for i, layer in enumerate(self.layers):
+            fused.gemv(f.h, layer.qkv, f.qkv, rows, f.n_qkv, hid, c["qkv"], bm, b_buf, a_buf,
+                       eps, norm_w=layer.in_w, n_parts=parts, parts_block=pb, part=f.part)
+            # K/V for all T rows land in the cache here (per-sequence base
+            # positions), so the attention kernel below only reads.
+            q = ops.qkv_post_rows(f.qkv, layer.q_norm, layer.k_norm, self.cos, self.sin,
+                                  sp.lens, st.k_cache[i], st.v_cache[i], sp.t,
+                                  self.nq, self.nkv, eps, per_seq=True)
+            a = spec.spec_attention(q, st.k_cache[i], st.v_cache[i], sp.lens, st.batch, sp.t,
+                                    self.nq, self.nkv, self.head_dim, st.attn.sm_scale_log2,
+                                    block_n=st.attn.block_n)
+            fused.gemv(a, layer.o, None, rows, hid, f.k_o, c["o"], bm, b_buf, a_buf, eps,
+                       res=f.h, parts_block=pp, part=f.part)
+            fused.gemv(f.h, layer.gate_up, f.act, rows, f.inter, hid, c["gate_up"], bm, a_buf,
+                       b_buf, eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True,
+                       parts_block=pb, part=f.part)
+            fused.gemv(f.act, layer.down, None, rows, hid, f.inter, c["down"], bm, a_buf, b_buf,
+                       eps, res=f.h, parts_block=pp, part=f.part)
+            parts = f.parts_down
+        fused.gemv(f.h, self.lm_w, f.logits, rows, f.vocab, hid, c["lm"], bm, b_buf, a_buf, eps,
+                   norm_w=self.norm_w, n_parts=parts, parts_block=pb, part=f.part)
+        self._argmax_into(f.logits, sp.out_tok)
+        spec.accept(sp.out_tok, sp.draft, sp.hist, sp.lens, sp.naccept, sp.k, sp.t, sp.stop_len)
+
+    def _spec_reset(self, st, prompt, first):
+        """Prompt plus the first generated token form the history; the cache
+        holds the prompt, so lens = prompt length."""
+        sp = st.spec
+        s = st.prompt_len
+        sp.hist[:, :s].copy_(prompt)
+        sp.hist[:, s].copy_(first)
+        sp.lens.fill_(s)
+
+    def _capture_spec(self, st):
+        sp = st.spec
+        # Warm at a realistic length: the kernels read the cache and the
+        # history up to lens, and the sample lengths start at the prompt.
+        sp.hist.zero_()
+        sp.lens.fill_(st.prompt_len)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self._spec_step(st)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._spec_step(st)
+        torch.cuda.synchronize()
+        return graph
+
+    def _check_spec(self, st, n_check=8):
+        """The judge's test, run locally: produce tokens speculatively, then
+        feed them back through the plain step one at a time and require each
+        to be that step's argmax (or inside a fraction of the 2.0-logit tie
+        margin). A wrong accept rule shows up here immediately."""
+        sp = st.spec
+        batch, s = st.batch, st.prompt_len
+        gen = torch.Generator(device="cpu").manual_seed(99)
+        prompt = torch.randint(100, 100000, (batch, s), generator=gen).to(self.device)
+        first = self._prefill(st, prompt)
+        self._spec_reset(st, prompt, first)
+        seqs = [[int(x)] for x in first.tolist()]
+        want_len = max(2, min(n_check, st.new_tokens))
+        for _ in range(want_len):
+            if min(len(q) for q in seqs) >= want_len:
+                break
+            self._spec_step(st)
+            toks = sp.out_tok.view(batch, sp.t).tolist()
+            accs = sp.naccept.tolist()
+            for b in range(batch):
+                seqs[b].extend(toks[b][:accs[b] + 1])
+        limit = min(want_len, min(len(q) for q in seqs))
+        if limit < 2:
+            return False, "speculation produced no tokens"
+
+        self._prefill(st, prompt)  # replay from the same prefix
+        st.pos.fill_(s)
+        st.ids.copy_(first)
+        worst, bad = 0.0, 0
+        for step in range(1, limit):
+            logits = st.step(st).float()
+            want = torch.tensor([q[step] for q in seqs], dtype=torch.int64, device=self.device)
+            top = logits.max(dim=-1).values
+            got = logits.gather(1, want[:, None])[:, 0]
+            gap = top - got
+            worst = max(worst, gap.max().item())
+            bad += int((gap > 0.5).sum().item())
+            st.ids.copy_(want)  # teacher-force our own tokens, as the judge does
+            st.pos.fill_(s + step)
+        return bad == 0, (f"{limit} tokens x{batch} replayed, worst margin {worst:.3f}, "
+                          f"{bad} outside 0.5")
+
+    def _spec_stream(self, st, steps):
+        """Yield the remaining steps from speculative iterations.
+
+        Each iteration hands every live sequence at least one token, and a
+        sequence that has all of its tokens stops advancing with its queue
+        already long enough, so the loop always makes progress."""
+        sp = st.spec
+        queues = [collections.deque() for _ in range(st.batch)]
+        emitted = 1
+        iters = 0
+        cap = 4 * steps + 16  # cannot happen; a hang would cost the whole run
+        while emitted < steps and iters < cap:
+            with torch.inference_mode():
+                if sp.graph is not None:
+                    sp.graph.replay()
+                else:
+                    self._spec_step(st)
+                sp.host_tok.copy_(sp.out_tok, non_blocking=True)
+                sp.host_acc.copy_(sp.naccept, non_blocking=True)
+                sp.event.record()
+            sp.event.synchronize()
+            iters += 1
+            toks = sp.host_tok.view(st.batch, sp.t).tolist()
+            accs = sp.host_acc.tolist()
+            for b in range(st.batch):
+                queues[b].extend(toks[b][:accs[b] + 1])
+            while emitted < steps and all(queues):
+                row = [q.popleft() for q in queues]
+                emitted += 1
+                if emitted == steps and st.spec_on is None:
+                    # Measured on the judge's own warmup prompt, so this is
+                    # the real acceptance rate for this workload's corpus.
+                    gain = (steps - 1) / max(iters, 1)
+                    net = gain / max(sp.cost, 1e-6)
+                    st.spec_on = net >= SPEC_MIN_NET_GAIN
+                    _log(f"spec measured {gain:.2f} tokens/iteration at {sp.cost:.2f}x cost "
+                         f"-> net {net:.2f}x -> {'keep for the samples' if st.spec_on else 'off'}")
+                yield row
+        while emitted < steps:  # only reachable from a bug in the accept rule
+            _log("spec stream stalled; falling back and disabling speculation")
+            st.spec_on = False
+            row = [q[-1] if q else 0 for q in queues]
+            emitted += 1
+            yield row
+
+    def _setup_spec(self, st, prompt_len, new_tokens, spec_k=SPEC_K):
+        start = time.perf_counter()
+        sp = _SpecPlan(self, st, spec_k, SPEC_NGRAM)
+        sp.stop_len = prompt_len + new_tokens - 1
+        st.spec = sp
+        f = sp.fused
+        deadline = start + SPEC_TUNE_BUDGET_S
+        for role in f.ROLES:
+            f.cfg[role] = self._tune_gemv(f, role, deadline, limit=4)
+            if role == "down":
+                f.parts_o = f.hidden // f.cfg["o"].bn
+                f.parts_down = f.hidden // f.cfg["down"].bn
+                most = max(f.parts_o, f.parts_down)
+                f.parts_block = max(2, 1 << (most - 1).bit_length())
+        ok, detail = self._check_spec(st)
+        _log(f"spec verify: {detail} -> {'ok' if ok else 'REJECTED'}")
+        if not ok:
+            st.spec = None
+            return
+        sp.graph = self._capture_spec(st)
+        reps = min(8, max(2, new_tokens // sp.t))
+        sp.lens.fill_(prompt_len)
+        t_spec = self._time_replays(sp.graph, 2, reps)
+        t_plain = self._time_graph(st, st.graph, prompt_len, reps)
+        sp.cost = t_spec / max(t_plain, 1e-6)
+        _log(f"spec iteration {t_spec:.3f} ms vs {t_plain:.3f} ms per plain step "
+             f"({sp.cost:.2f}x): needs {SPEC_MIN_NET_GAIN * sp.cost:.2f} tokens per iteration "
+             f"to pay off (setup {time.perf_counter() - start:.1f}s)")
+
     # ------------------------------------------------------------- generation
 
     def _state_for(self, batch, prompt_len, new_tokens):
@@ -731,7 +961,16 @@ class Engine:
         self.state = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-        st = _ShapeState(self, batch, prompt_len, new_tokens)
+        # A speculative iteration feeds T = k+1 rows per sequence, so the
+        # fused GEMMs run at batch * T rows; keep that inside the tile limit.
+        spec_k = min(SPEC_K, max(0, FUSED_MAX_BATCH // max(batch, 1) - 1))
+        spec_ok = (self.fused_ok and self.use_graphs and new_tokens > 1 and spec_k >= 1)
+        # Pad by 2T, not T: the iteration that finishes a sequence can push
+        # its length to stop_len + k, and that sequence is still fed once
+        # more before the slowest one catches up, so its K/V writes reach
+        # stop_len + 2k. One slot too few corrupts the next sequence's cache.
+        st = _ShapeState(self, batch, prompt_len, new_tokens,
+                         pad=(2 * (spec_k + 1) if spec_ok else 0))
         self._ensure_rope(st.capacity)
         if self.device.type == "cuda" and (self.use_triton_attn or self.fused_ok):
             try:
@@ -754,6 +993,13 @@ class Engine:
                     _log(f"fused step unavailable: {type(exc).__name__}: {str(exc)[:300]}")
                     st.fused = None
                     st.step = self._decode_step
+        if spec_ok and st.graph is not None:
+            try:
+                self._setup_spec(st, prompt_len, new_tokens, spec_k)
+            except Exception as exc:
+                torch.cuda.synchronize()
+                st.spec = None
+                _log(f"speculation unavailable: {type(exc).__name__}: {str(exc)[:300]}")
         if self.use_graphs and batch * prompt_len <= PREFILL_GRAPH_MAX_TOKENS:
             try:
                 self._capture_prefill(st, batch, prompt_len)
@@ -765,6 +1011,7 @@ class Engine:
         _log(f"shape B={batch} S={prompt_len} N={new_tokens}: capacity {st.capacity}, "
              f"{st.attn.splits} attention splits, graph={'yes' if st.graph else 'no'}, "
              f"prefill_graph={'yes' if st.prefill_graph else 'no'}, "
+             f"spec={'k%d' % st.spec.k if st.spec is not None else 'no'}, "
              f"step={'fused' if st.fused is not None else 'v1'}, "
              f"setup {time.perf_counter() - start:.2f}s")
         return st
@@ -874,6 +1121,14 @@ class Engine:
                 st.ids.copy_(self._prefill(st, ids.to(self.device, non_blocking=True)))
             st.pos.fill_(prompt_len)
             self._publish(st, 0)
+            spec_active = st.spec is not None and st.spec_on is not False and steps > 1
+            if spec_active:
+                self._spec_reset(st, ids, st.ids)
+        if spec_active:
+            yield self._fetch(st, 0)
+            for row in self._spec_stream(st, steps):
+                yield row
+            return
         # Keep the GPU ahead of the caller: each step's graph reads the token
         # the previous one wrote on the device, and its copy to the host is
         # queued right behind it. Before the first token only one step is

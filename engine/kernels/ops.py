@@ -152,15 +152,21 @@ def _qkv_post_rows_kernel(
     q_out_ptr, k_cache_ptr, v_cache_ptr,
     T, stride_cb, stride_ch, stride_cs, eps,
     NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, BLOCK_HD: tl.constexpr,
+    PER_SEQ: tl.constexpr,
 ):
     # Same arithmetic as _qkv_post_kernel, but one program handles BLOCK_HD
     # heads of a row instead of one head, so a long prefill launches ~16x
-    # fewer (and fuller) programs.
+    # fewer (and fuller) programs. With PER_SEQ the base position is read per
+    # sequence instead of once: speculative verification runs sequences at
+    # different lengths, because acceptance differs per sequence.
     row = tl.program_id(0)  # b * T + t
     hh = tl.program_id(1) * BLOCK_HD + tl.arange(0, BLOCK_HD)
     b = row // T
     t = row % T
-    pos = tl.load(pos_ptr) + t
+    if PER_SEQ:
+        pos = tl.load(pos_ptr + b) + t
+    else:
+        pos = tl.load(pos_ptr) + t
     d = tl.arange(0, D)
     partner = (d + D // 2) % D
     dt = q_out_ptr.dtype.element_ty
@@ -191,8 +197,10 @@ def _qkv_post_rows_kernel(
     tl.store(v_cache_ptr + cache + (hh - NQ - NKV)[:, None] * stride_ch, x.to(dt), mask=is_v[:, None])
 
 
-def qkv_post_rows(qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, T, nq, nkv, eps):
-    """Drop-in replacement for :func:`qkv_post` (same inputs and outputs)."""
+def qkv_post_rows(qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, T, nq, nkv, eps,
+                  per_seq=False):
+    """Drop-in replacement for :func:`qkv_post` (same inputs and outputs).
+    With ``per_seq``, ``pos`` holds one base position per sequence."""
     m = qkv.shape[0]
     d = q_weight.shape[0]
     block_hd = 16
@@ -200,7 +208,7 @@ def qkv_post_rows(qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, T, n
     _qkv_post_rows_kernel[(m, triton.cdiv(nq + 2 * nkv, block_hd))](
         qkv, q_weight, k_weight, cos, sin, pos, q_out, k_cache, v_cache,
         T, k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), eps,
-        NQ=nq, NKV=nkv, D=d, BLOCK_HD=block_hd, num_warps=4,
+        NQ=nq, NKV=nkv, D=d, BLOCK_HD=block_hd, PER_SEQ=per_seq, num_warps=4,
     )
     return q_out
 

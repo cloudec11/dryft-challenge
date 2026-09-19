@@ -291,6 +291,15 @@ GEMV_SPLITK_CANDIDATES = (
 )
 
 
+def smem_bytes(cfg, block_m, glu):
+    """Shared memory a pipelined tile needs: the x tile plus one (or two, for
+    gate/up) weight tiles, per stage, in bytes."""
+    if cfg.vec:
+        return cfg.stages * (2 if glu else 1) * cfg.bn * cfg.bk * 2
+    per_stage = block_m * cfg.bk + (2 if glu else 1) * cfg.bk * cfg.bn
+    return cfg.stages * per_stage * 2
+
+
 def candidates(m, split_ok=False, split_first=False):
     base = (GEMV_VEC_CANDIDATES + GEMV_CANDIDATES[:3]) if m == 1 else GEMV_CANDIDATES
     if not split_ok:

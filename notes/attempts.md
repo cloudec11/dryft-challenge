@@ -13,6 +13,8 @@ workloads. Fill in the numbers from the run page.
 | 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | 882.2 | yes | run b4494a7a, **-1.4% regression**: the benchmark was L2-resident |
 | 6+7 | 6505b80 | v6 single-split attention + v7 split-8/argmax + cold-KV tuner fix | 888.2 | yes | run b54796c8; B16 best yet (715.8 ms), B1/B4 -2% |
 | 8 | cd5ef7c | v8: noise-robust tuner decisions (3% margin, min-of-rounds) | **902.9** | yes | run 84daa14e, **best so far, #22**; all three public shapes improved together |
+| 9 | 31212d0 | v9: split-K for every projection but the LM head | 883.6 | yes | run 881e52fa; ~2% down everywhere incl. untouched TTFT -> slower machine instance |
+| 10 | _tbd_ | v10: speculative decoding (n-gram drafts, exact verification) | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -342,3 +344,56 @@ split.
   and down (where run 4 proved it), and has to win by 3% for QKV and gate/up.
 - Partial buffer is now [2 * MAX_SPLIT, BLOCK_M, intermediate] FP32 (10 MB at
   batch 16), the widest any role needs.
+
+## Run 8 (official 881e52fa, v9) - score 883.57
+
+| Workload | TPS | Batch time | TTFT | TPOT |
+|---|---:|---:|---:|---:|
+| B1 512->32 | 241.4 | 132.6 ms | 10.17 ms | 3.948 ms |
+| B4 2048->32 | 470.5 | 272.1 ms | 120.25 ms | 4.897 ms |
+| B16 512->128 | 2804.5 | 730.3 ms | 109.46 ms | 4.894 ms |
+
+Reads as ~2% below v8 everywhere - including TTFT at B4 (120.25 vs 116.74),
+which v9 did not touch at all. So this run most likely landed on a slower
+machine instance rather than regressing. Kept: split-K only activates where
+it wins its own race by 3%.
+
+## v10: speculative decoding (n-gram drafts, exact verification)
+
+The gap to #1 (1144) is +27%, which no amount of tile tuning reaches: decode
+is at ~58% of the 2.8 ms/step bandwidth floor at B16, so even perfect
+streaming is +40% on decode and nothing else is close. Speculation is the
+only lever that changes tokens per weight-stream.
+
+- `kernels/spec.py`: draft, verify, accept.
+  - **draft**: the last NGRAM=2 tokens of a sequence's own history, matched
+    against that history, most recent match wins, K=3 following tokens
+    copied. Runs on device from a history buffer, so the whole iteration is
+    still one graph replay.
+  - **verify**: the *fused decode step* over T=K+1 rows per sequence, not a
+    prefill-shaped path. That is the crux: prefill-shaped verification costs
+    ~1.4x a step and eats the entire gain, while the fused path at M=batch*T
+    costs ~1.1x because the step is weight-bound either way.
+  - **accept**: a = leading drafts that match the model's own argmax; emit
+    a+1 tokens. Correct by construction - a token is emitted only if it is
+    the argmax given the tokens before it - so this does not spend any of
+    the 2.0-logit budget.
+- Per-sequence positions throughout (`lens` vector, not a scalar): sequences
+  accept different amounts, so `qkv_post_rows` gained a PER_SEQ mode and the
+  attention kernel takes per-sequence lengths with row-dependent masking.
+- Gating, in three layers:
+  1. `_check_spec` replays the speculative output through the plain step
+     teacher-forced - the judge's own test, locally - and rejects on any
+     token outside 0.5 logits.
+  2. The iteration cost is measured against a plain step, and acceptance is
+     measured **on the judge's own warmup prompt** (same corpus as the
+     samples). Speculation stays on only if measured tokens/iteration beats
+     the cost ratio by 5%.
+  3. Any exception in setup falls back to the plain step.
+- Cache padded by 2T, because the iteration that finishes a sequence can
+  push its length to stop_len + k and it is fed once more after that.
+
+Known risk: **the sample-spread gate.** Acceptance varies by prompt, so
+sample times vary; over 25% spread fails the workload. A failed run keeps
+the best score, so the cost of being wrong is one run and the failure code
+tells us which way.
