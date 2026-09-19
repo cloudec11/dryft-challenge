@@ -150,7 +150,7 @@ def _gemv_vec_kernel(
         tl.store(out_ptr + offs_n, y.to(dt))
 
 
-MAX_SPLIT = 4  # rows of the FP32 partial buffer a split-K projection needs
+MAX_SPLIT = 8  # rows of the FP32 partial buffer a split-K projection needs
 
 
 @triton.jit
@@ -246,6 +246,8 @@ GEMV_SPLITK_CANDIDATES = (
     GemvConfig(64, 128, 4, 4, split=4),
     GemvConfig(32, 128, 4, 4, split=4),
     GemvConfig(128, 128, 3, 8, split=2),
+    GemvConfig(64, 128, 4, 4, split=8),
+    GemvConfig(32, 128, 4, 4, split=8),
 )
 
 
@@ -322,10 +324,10 @@ def embed_ssq(ids, emb, h, ssq):
 @triton.jit
 def _attn_fused_split_kernel(
     qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr,
-    k_ptr, v_ptr, po_ptr, pm_ptr, pl_ptr,
+    k_ptr, v_ptr, po_ptr, pm_ptr, pl_ptr, out_ptr,
     stride_cb, stride_ch, stride_cs, chunk, num_splits, sm_scale_log2, eps,
     NQ: tl.constexpr, NKV: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, ONE_SPLIT: tl.constexpr,
 ):
     # ops._decode_attn_split_kernel with ops._qkv_post_kernel folded in. Every
     # program rebuilds its group's rotated q and the new k/v from the raw QKV
@@ -403,10 +405,16 @@ def _attn_fused_split_kernel(
     tl.store(k_ptr + new_off, k_new, mask=(offs_d < D) & owner)
     tl.store(v_ptr + new_off, v_new, mask=(offs_d < D) & owner)
 
-    part = (b * NQ + heads).to(tl.int64) * num_splits + split
-    tl.store(po_ptr + part[:, None] * D + offs_d[None, :], acc, mask=h_mask[:, None])
-    tl.store(pm_ptr + part, m_i, mask=h_mask)
-    tl.store(pl_ptr + part, l_i, mask=h_mask)
+    if ONE_SPLIT:
+        # One split spans the sequence: normalise here and skip the reduce.
+        o = (acc / l_i[:, None]).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + b.to(tl.int64) * (NQ * D) + heads[:, None] * D + offs_d[None, :], o,
+                 mask=h_mask[:, None])
+    else:
+        part = (b * NQ + heads).to(tl.int64) * num_splits + split
+        tl.store(po_ptr + part[:, None] * D + offs_d[None, :], acc, mask=h_mask[:, None])
+        tl.store(pm_ptr + part, m_i, mask=h_mask)
+        tl.store(pl_ptr + part, l_i, mask=h_mask)
 
 
 def attention_fused(attn, qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, eps):
@@ -416,17 +424,20 @@ def attention_fused(attn, qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cac
     ``qkv`` is the raw ``[B, (nq + 2 nkv) * D]`` projection. Returns
     ``[B, nq * D]`` like ``DecodeAttention.__call__``."""
     out = torch.empty((attn.batch, attn.nq * attn.d), dtype=qkv.dtype, device=qkv.device)
+    one = attn.splits == 1
     _attn_fused_split_kernel[(attn.batch, attn.nkv, attn.splits)](
-        qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache, attn.po, attn.pm, attn.pl,
+        qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cache,
+        attn.po, attn.pm, attn.pl, out,
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         attn.chunk, attn.splits, attn.sm_scale_log2, eps,
         NQ=attn.nq, NKV=attn.nkv, GROUP=attn.group, D=attn.d,
         BLOCK_H=max(16, triton.next_power_of_2(attn.group)), BLOCK_N=attn.block_n,
-        num_warps=attn.num_warps, num_stages=attn.num_stages,
+        ONE_SPLIT=one, num_warps=attn.num_warps, num_stages=attn.num_stages,
     )
-    _decode_attn_reduce_kernel[(attn.batch, attn.nq)](
-        attn.po, attn.pm, attn.pl, out, attn.splits,
-        NQ=attn.nq, D=attn.d, SPLITS=max(2, triton.next_power_of_2(attn.splits)),
-        num_warps=4,
-    )
+    if not one:
+        _decode_attn_reduce_kernel[(attn.batch, attn.nq)](
+            attn.po, attn.pm, attn.pl, out, attn.splits,
+            NQ=attn.nq, D=attn.d, SPLITS=max(2, triton.next_power_of_2(attn.splits)),
+            num_warps=4,
+        )
     return out
