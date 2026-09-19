@@ -71,8 +71,10 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
 FUSED_MAX_BATCH = 128
-# Warmup seconds allowed for tuning the fused step's GEMM tiles.
+# Warmup seconds allowed for tuning the fused step's GEMM tiles, and for the
+# decode attention tile shape.
 TUNE_BUDGET_S = 90.0
+ATTN_TUNE_BUDGET_S = 25.0
 
 
 def _log(message):
@@ -534,6 +536,77 @@ class Engine:
              + " ".join(f"{c}={t:.1f}" for t, c in timings[1:]))
         return best
 
+    def _tune_attention(self, st, deadline):
+        """Race the decode attention's tile width and split count.
+
+        At a large batch times context the KV read is most of the step -- at
+        batch 32 over 2048 tokens it is ~9.8 GB per step against 8.05 GB of
+        weights -- so this is worth measuring rather than predicting. The
+        tiling does not change what the kernel computes, but the winner is
+        checked against the FP32 reference anyway."""
+        batch, cap = st.batch, st.capacity
+        layer = self.layers[0]
+        q = self._randn(batch, self.nq * self.head_dim, scale=2.0)
+        qkv = self._randn(batch, layer.qkv.shape[0], scale=2.0)
+        kc, vc = st.k_cache[0], st.v_cache[0]
+        # Attention over a zeroed cache is a uniform softmax; give the timing
+        # and the check real values. Prefill overwrites these slots.
+        kc.normal_(0.0, 2.0)
+        vc.normal_(0.0, 1.0)
+        pos = torch.tensor([cap - 1], dtype=torch.int32, device=self.device)
+        use_fused = self.fused_ok and batch <= FUSED_MAX_BATCH
+        reps = 4
+        timings = []
+        for cand in ops.ATTN_CANDIDATES:
+            block_n, target, warps, stages = cand
+            graph = None
+            try:
+                attn = ops.DecodeAttention(
+                    batch, cap, self.nq, self.nkv, self.head_dim, self.device,
+                    target_programs=target, block_n=block_n, num_warps=warps, num_stages=stages,
+                )
+
+                def run():
+                    for _ in range(reps):
+                        if use_fused:
+                            fused.attention_fused(attn, qkv, layer.q_norm, layer.k_norm,
+                                                  self.cos, self.sin, pos, kc, vc, self.eps)
+                        else:
+                            attn(q, kc, vc, pos)
+
+                run()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
+                graph.replay()
+                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                e0.record()
+                for _ in range(3):
+                    graph.replay()
+                e1.record()
+                e1.synchronize()
+                timings.append((e0.elapsed_time(e1) * 1000.0 / (3 * reps), cand, attn))
+            except Exception as exc:
+                torch.cuda.synchronize()
+                _log(f"  attn {cand}: skipped ({type(exc).__name__}: {str(exc)[:100]})")
+            finally:
+                del graph
+            if timings and time.perf_counter() > deadline:
+                break
+        if not timings:
+            return
+        timings.sort(key=lambda t: t[0])
+        us, cand, attn = timings[0]
+        ok, detail = self._agree(attn(q, kc, vc, pos),
+                                 ops.decode_attention_ref(q, kc, vc, pos, self.nq, self.nkv),
+                                 min_exact=0.0)
+        kv_kb = batch * self.nkv * cap * self.head_dim * 2 * 2 / 1e3
+        _log(f"  attn best {cand} {us:.1f}us ({kv_kb / us:.0f} GB/s of KV), {detail}; "
+             + " ".join(f"{c}={t:.1f}" for t, c, _ in timings[1:]))
+        if ok:
+            st.attn = attn
+
     def _check_fused(self, st, prompt_len, new_tokens):
         """Logits of the fused step vs the v1 step on the same synthetic
         prompt and the same forced tokens, over a few consecutive steps."""
@@ -622,6 +695,12 @@ class Engine:
             torch.cuda.empty_cache()
         st = _ShapeState(self, batch, prompt_len, new_tokens)
         self._ensure_rope(st.capacity)
+        if self.device.type == "cuda" and (self.use_triton_attn or self.fused_ok):
+            try:
+                self._tune_attention(st, time.perf_counter() + ATTN_TUNE_BUDGET_S)
+            except Exception as exc:
+                torch.cuda.synchronize()
+                _log(f"attention tuning skipped: {type(exc).__name__}: {str(exc)[:200]}")
         if self.use_graphs and new_tokens > 1:
             try:
                 st.graph = self._capture(st, self._decode_step)

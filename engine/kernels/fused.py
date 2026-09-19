@@ -421,8 +421,8 @@ def attention_fused(attn, qkv, q_weight, k_weight, cos, sin, pos, k_cache, v_cac
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         attn.chunk, attn.splits, attn.sm_scale_log2, eps,
         NQ=attn.nq, NKV=attn.nkv, GROUP=attn.group, D=attn.d,
-        BLOCK_H=max(16, triton.next_power_of_2(attn.group)), BLOCK_N=attn.BLOCK_N,
-        num_warps=4,
+        BLOCK_H=max(16, triton.next_power_of_2(attn.group)), BLOCK_N=attn.block_n,
+        num_warps=attn.num_warps, num_stages=attn.num_stages,
     )
     _decode_attn_reduce_kernel[(attn.batch, attn.nq)](
         attn.po, attn.pm, attn.pl, out, attn.splits,

@@ -9,7 +9,8 @@ workloads. Fill in the numbers from the run page.
 | 1 | 5aed25f | v1: hand-rolled forward, static KV cache, CUDA-graph decode, fused Triton kernels | 855.3 | yes | official run c0c37a87, leaderboard #25; samples below |
 | 2 | daedece | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | 882.2 | yes | official run 4e9a638e, +3.1% over v1 |
 | 3 | 94660b0 | v3: prefill CUDA graph (raced), single-row GEMV for B1, lookahead 1 before first token | 882.7 | yes | official run 3bdf08de; B1 +13% but score flat -> hidden shapes are not batch 1 |
-| 4 | _tbd_ | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | | | |
+| 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | | | run a93ebf2b |
+| 5 | _tbd_ | v5: decode attention tile/split tuned at warmup | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -175,3 +176,14 @@ Split-K fixes both (more tiles, larger BLOCK_N).
 - Tuning budget is sliced per role so the producers cannot starve the rest.
 - LOOKAHEAD back to 3 after the first token (v3 used 2 and B4/B16 TPOT drifted
   +2%; the first-token ramp already protects TTFT).
+
+## v5 changes
+
+- `ops.ATTN_CANDIDATES`: BLOCK_N 64/128/256 x target programs 132/264/528 x
+  warps, raced at warmup with pos = capacity - 1 (the worst case) and checked
+  against the FP32 reference before use. The old values were fixed constants
+  (BLOCK_N 64, 264 programs, 4 warps).
+- Rationale: at batch 32 over a 2048-token context the KV read is ~9.8 GB per
+  step against 8.05 GB of weights, so at the batch sizes the hidden set seems
+  to use, attention -- not the projections -- can be the larger half of the
+  step. A fixed tiling is a guess; this measures it.
