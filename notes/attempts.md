@@ -11,8 +11,8 @@ workloads. Fill in the numbers from the run page.
 | 3 | 94660b0 | v3: prefill CUDA graph (raced), single-row GEMV for B1, lookahead 1 before first token | 882.7 | yes | official run 3bdf08de; B1 +13% but score flat -> hidden shapes are not batch 1 |
 | 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | 894.5 | yes | run a93ebf2b, +1.3%; TPOT down at every public shape |
 | 5 | 912d2ba | v5: decode attention tile/split tuned at warmup | 882.2 | yes | run b4494a7a, **-1.4% regression**: the benchmark was L2-resident |
-| 6 | _tbd_ | v6: single-split attention writes its output directly (no reduce launch) | | | |
-| 7 | _tbd_ | v7: split-8 GEMV candidates, argmax writes the id buffer in place | | | |
+| 6+7 | 6505b80 | v6 single-split attention + v7 split-8/argmax + cold-KV tuner fix | 888.2 | yes | run b54796c8; B16 best yet (715.8 ms), B1/B4 -2% |
+| 8 | _tbd_ | v8: noise-robust tuner decisions (3% margin, min-of-rounds) | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -249,3 +249,38 @@ that is wrong for cold reads.
 Lesson, the same one the GEMV tuner already encodes: **a warmup benchmark must
 touch as much distinct memory as the real step does.** Fixed by timing one
 call per layer over that layer's own cache.
+
+## Run 6 (official b54796c8, v6+v7+tuner fix) - score 888.23
+
+| Workload | TPS | Batch time | TTFT | TPOT | Memory |
+|---|---:|---:|---:|---:|---:|
+| B1 512->32 | 240.1 | 133.3 ms | 10.83 ms | 3.952 ms | 10.34 GiB |
+| B4 2048->32 | 474.2 | 269.9 ms | 117.45 ms | 4.906 ms | 12.93 GiB |
+| B16 512->128 | 2861.0 | 715.8 ms | 106.32 ms | 4.799 ms | 13.17 GiB |
+
+(The run also carried a platform-side `harness_error` note on an attempt;
+the measurement itself completed and scored.)
+
+B16 is the best result so far (-1.8% batch time vs v4), consistent with the
+single-split attention dropping 36 launches per step. B1 and B4 each gave
+back ~2%.
+
+### Score noise
+
+Hidden scores so far: 882.15, 882.68, 894.48, 882.24, 888.23. Clocks are not
+locked and each run measures 5 samples per shape, so **run-to-run noise is
+~1-2% and any single-run delta below ~2% is not evidence.** v4's split-K win
+was real because TPOT improved on all three public shapes at once; most other
+deltas are not distinguishable from noise.
+
+Consequence for the design: a tuner that takes the bare minimum of noisy
+measurements will sometimes pick a worse configuration, which is the likely
+cause of B1 losing its single-row GEMV to a split-K candidate in run 6.
+
+## v8 changes
+
+- Every warmup race now needs a 3% win to move off the earlier (safer)
+  candidate: GEMV tiles, attention tiles, fused-vs-v1, prefill graph-vs-eager.
+  Candidate lists are ordered so earlier means "what already worked".
+- Timings are the min over 2 rounds of 2 replays rather than the mean of 3,
+  so one disturbed round cannot decide a race.
