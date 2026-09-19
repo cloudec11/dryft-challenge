@@ -9,7 +9,7 @@ workloads. Fill in the numbers from the run page.
 | 1 | 5aed25f | v1: hand-rolled forward, static KV cache, CUDA-graph decode, fused Triton kernels | 855.3 | yes | official run c0c37a87, leaderboard #25; samples below |
 | 2 | daedece | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | 882.2 | yes | official run 4e9a638e, +3.1% over v1 |
 | 3 | 94660b0 | v3: prefill CUDA graph (raced), single-row GEMV for B1, lookahead 1 before first token | 882.7 | yes | official run 3bdf08de; B1 +13% but score flat -> hidden shapes are not batch 1 |
-| 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | | | run a93ebf2b |
+| 4 | beb0732 | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | 894.5 | yes | run a93ebf2b, +1.3%; TPOT down at every public shape |
 | 5 | _tbd_ | v5: decode attention tile/split tuned at warmup | | | |
 
 ## v1 design (branch `fast-engine`)
@@ -187,3 +187,23 @@ Split-K fixes both (more tiles, larger BLOCK_N).
   step against 8.05 GB of weights, so at the batch sizes the hidden set seems
   to use, attention -- not the projections -- can be the larger half of the
   step. A fixed tiling is a guess; this measures it.
+
+## v4 sample cases (run 4, official a93ebf2b) - score 894.48 (+1.34%)
+
+| Workload | TPS | Batch time | TTFT | TPOT | Memory |
+|---|---:|---:|---:|---:|---:|
+| B1 512->32 | 244.3 | 131.0 ms | 11.13 ms | 3.863 ms | 10.34 GiB |
+| B4 2048->32 | 472.3 | 271.0 ms | 122.23 ms | 4.806 ms | 12.93 GiB |
+| B16 512->128 | 2810.5 | 728.7 ms | 108.76 ms | 4.883 ms | 13.19 GiB |
+
+Split-K is a real win: TPOT -2.1% (B1), -3.5% (B4), -2.6% (B16), and the
+hidden score moved with it (+1.34%), so the hidden shapes are decode-bound
+as suspected. Memory +0.35 GiB from the FP32 partial buffer. TTFT drifted
++3% with no prefill change in this version: between-run noise is ~3%.
+
+Where decode still stands at B16: 4.883 ms/step. Weights 8.05 GB + KV 1.4 GB
+at 3.35 TB/s = 2.8 ms floor, so ~1.7x off, i.e. the projections stream at
+roughly 55% of peak bandwidth. cuBLAS (v1) was no better, which points at a
+structural cause rather than a bad kernel: ~220 launches per step, each
+kernel short enough (9-30 us) that wave fill and drain are a large fraction
+of it. That makes kernel count, not arithmetic, the thing to attack next.
