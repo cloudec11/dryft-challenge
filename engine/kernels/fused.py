@@ -150,14 +150,73 @@ def _gemv_vec_kernel(
         tl.store(out_ptr + offs_n, y.to(dt))
 
 
-class GemvConfig:
-    __slots__ = ("bn", "bk", "stages", "warps", "vec")
+MAX_SPLIT = 4  # rows of the FP32 partial buffer a split-K projection needs
 
-    def __init__(self, bn, bk, stages, warps, vec=False):
-        self.bn, self.bk, self.stages, self.warps, self.vec = bn, bk, stages, warps, vec
+
+@triton.jit
+def _gemv_splitk_kernel(
+    x_ptr, w_ptr, part_ptr, M, N, K,
+    SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # One program per (column tile, K slice). N = 2560 tiles into only 160
+    # programs at BLOCK_N = 16, so a plain grid leaves the second wave a
+    # fifth full on 132 SMs; splitting K multiplies the program count and
+    # lets BLOCK_N grow, which also cuts the repeated reads of x.
+    pid_n = tl.program_id(0)
+    s = tl.program_id(1)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    k_span = K // SPLIT
+    k_start = s * k_span
+    x_ptrs = x_ptr + offs_m[:, None] * K + k_start + offs_k[None, :]
+    w_ptrs = w_ptr + offs_n[None, :].to(tl.int64) * K + k_start + offs_k[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, k_span, BLOCK_K):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptrs)
+        acc += tl.dot(x, w)
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K
+    dst = part_ptr + s * (BLOCK_M * N) + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(dst, acc, mask=m_mask[:, None])
+
+
+@triton.jit
+def _gemv_splitk_reduce_kernel(
+    part_ptr, res_ptr, ssq_out_ptr, M, N,
+    SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SS_STRIDE: tl.constexpr,
+):
+    # Sums the FP32 slices and runs the RES_OUT epilogue. The slices add up
+    # in FP32 and round to BF16 once, exactly as the unsplit GEMM does.
+    pid = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    off = offs_m[:, None] * N + offs_n[None, :]
+    dt = res_ptr.dtype.element_ty
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for s in tl.static_range(SPLIT):
+        acc += tl.load(part_ptr + s * (BLOCK_M * N) + off, mask=m_mask[:, None], other=0.0)
+    d = acc.to(dt).to(tl.float32)
+    r = tl.load(res_ptr + off, mask=m_mask[:, None], other=0.0).to(tl.float32)
+    h = (r + d).to(dt)
+    tl.store(res_ptr + off, h, mask=m_mask[:, None])
+    hf = tl.where(m_mask[:, None], h.to(tl.float32), 0.0)
+    tl.store(ssq_out_ptr + pid * SS_STRIDE + offs_m, tl.sum(hf * hf, axis=1), mask=m_mask)
+
+
+class GemvConfig:
+    __slots__ = ("bn", "bk", "stages", "warps", "vec", "split")
+
+    def __init__(self, bn, bk, stages, warps, vec=False, split=1):
+        self.bn, self.bk, self.stages, self.warps = bn, bk, stages, warps
+        self.vec, self.split = vec, split
 
     def __repr__(self):
-        return f"{'vec' if self.vec else 'mma'}{self.bn}x{self.bk}s{self.stages}w{self.warps}"
+        kind = "vec" if self.vec else ("k%d-" % self.split if self.split > 1 else "mma")
+        return f"{kind}{self.bn}x{self.bk}s{self.stages}w{self.warps}"
 
 
 # Tried per projection during warmup; the fastest one that compiles wins.
@@ -178,12 +237,29 @@ GEMV_CANDIDATES = (
 )
 
 
-def candidates(m):
-    return (GEMV_VEC_CANDIDATES + GEMV_CANDIDATES[:3]) if m == 1 else GEMV_CANDIDATES
+# Only the residual-writing projections (N = hidden) use split-K: the others
+# already tile into enough programs, and their prologues/epilogues would have
+# to move into the reduce kernel.
+GEMV_SPLITK_CANDIDATES = (
+    GemvConfig(64, 256, 3, 4, split=2),
+    GemvConfig(32, 256, 3, 4, split=2),
+    GemvConfig(64, 128, 4, 4, split=4),
+    GemvConfig(32, 128, 4, 4, split=4),
+    GemvConfig(128, 128, 3, 8, split=2),
+)
+
+
+def candidates(m, split_ok=False):
+    base = (GEMV_VEC_CANDIDATES + GEMV_CANDIDATES[:3]) if m == 1 else GEMV_CANDIDATES
+    if not split_ok:
+        return base
+    # Split-K first: it is the candidate that fixes the wave quantization of
+    # the N = 2560 projections, and the budget may not reach the whole list.
+    return GEMV_SPLITK_CANDIDATES + base[:3]
 
 
 def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
-         norm_w=None, n_parts=1, res=None, glu=False, parts_block=SSQ_PARTS):
+         norm_w=None, n_parts=1, res=None, glu=False, parts_block=SSQ_PARTS, part=None):
     """``x[:m] @ w.T`` into ``out`` (or into ``res`` in place when ``res`` is
     given), with the fusions described above. ``ssq_in``/``ssq_out`` are
     ``[SSQ_PARTS, block_m]`` FP32 buffers and are always passed, even when
@@ -193,6 +269,19 @@ def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
     res_out = res is not None
     dst = res if res_out else out
     nw = norm_w if norm_in else w
+    if cfg.split > 1:
+        assert res_out and not norm_in and not glu
+        _gemv_splitk_kernel[(n // cfg.bn, cfg.split)](
+            x, w, part, m, n, k,
+            SPLIT=cfg.split, BLOCK_M=block_m, BLOCK_N=cfg.bn, BLOCK_K=cfg.bk,
+            num_warps=cfg.warps, num_stages=cfg.stages,
+        )
+        _gemv_splitk_reduce_kernel[(n // cfg.bn,)](
+            part, res, ssq_out, m, n,
+            SPLIT=cfg.split, BLOCK_M=block_m, BLOCK_N=cfg.bn, SS_STRIDE=block_m,
+            num_warps=4,
+        )
+        return
     if cfg.vec:
         assert m == 1
         _gemv_vec_kernel[(n // cfg.bn,)](

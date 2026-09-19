@@ -8,7 +8,8 @@ workloads. Fill in the numbers from the run page.
 | 0 | 186912a | Baseline (Transformers, unchanged) | _hidden score?_ | yes | samples below |
 | 1 | 5aed25f | v1: hand-rolled forward, static KV cache, CUDA-graph decode, fused Triton kernels | 855.3 | yes | official run c0c37a87, leaderboard #25; samples below |
 | 2 | daedece | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | 882.2 | yes | official run 4e9a638e, +3.1% over v1 |
-| 3 | _tbd_ | v3: prefill CUDA graph (<=4096 tok), single-row GEMV kernel for B1, lookahead 1 before first token | | | |
+| 3 | 94660b0 | v3: prefill CUDA graph (raced), single-row GEMV for B1, lookahead 1 before first token | 882.7 | yes | official run 3bdf08de; B1 +13% but score flat -> hidden shapes are not batch 1 |
+| 4 | _tbd_ | v4: split-K GEMV for the N=2560 projections, fused step tried up to batch 128 | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -133,3 +134,44 @@ What we learned:
   accumulator. Tried first at B1, tile kernel still tried as a fallback.
 - Sum-of-squares buffers grow to 1024 partials (BLOCK_N can now be 4) and the
   norm-in consumers are tuned after the producers so PARTS matches.
+
+## v3 sample cases (run 3, official 3bdf08de) - score 882.68
+
+| Workload | TPS | Batch time | TTFT | TPOT | Memory |
+|---|---:|---:|---:|---:|---:|
+| B1 512->32 | 241.2 | 132.6 ms | 10.46 ms | 3.945 ms | 10.34 GiB |
+| B4 2048->32 | 469.9 | 272.4 ms | 118.45 ms | 4.981 ms | 12.58 GiB |
+| B16 512->128 | 2756.8 | 742.9 ms | 106.98 ms | 5.013 ms | 12.84 GiB |
+
+- B1: prefill graph won (TTFT 19.2 -> 10.5, below v1's 14.4) and TPOT fell
+  under v2's 4.25, so the single-row GEMV won the race: the fused step is
+  live at batch 1. Total -12%, TPS +13%.
+- B4/B16: prefill graph lost its race (memory unchanged, TTFT unchanged), and
+  TPOT drifted +2%. Clocks are not locked, so treat ~2% between runs as noise.
+
+**The score moved 0.06% while B1 moved 13%, so no hidden workload is batch 1.**
+Hidden geomean TPS is 883 against 678 for the three public shapes, so the
+hidden set is faster per token: larger batches and/or longer outputs, i.e.
+decode-dominated. Optimize decode at batch >= 4 and prefill, not batch 1.
+
+Decode budget at B16: weights 8.05 GB + KV ~1.4 GB per step = ~2.8 ms at
+3.35 TB/s, measured 5.01 ms. Suspected waste: the O and down projections
+(N=2560) tile into 160 programs over 132 SMs, so the second wave is ~21%
+full, and every program re-reads all of x from L2 (52 MB per layer at M=64).
+Split-K fixes both (more tiles, larger BLOCK_N).
+
+## v4 changes
+
+- `_gemv_splitk_kernel` + `_gemv_splitk_reduce_kernel` for the O and down
+  projections (N = hidden): each program takes one K slice, writes FP32
+  partials, and the reduce kernel sums them (FP32, rounded to BF16 once, like
+  the unsplit GEMM) and runs the residual-add + sum-of-squares epilogue.
+  Split-K tiles are tried first for those two roles: split 2/4 with BLOCK_N
+  32-128 gives 40-320 tiles per slice instead of 160 unsplit, and the larger
+  BLOCK_N also cuts the repeated L2 reads of x (52 MB -> 13 MB per layer at
+  M=64, BLOCK_N 16 -> 64).
+- Fused step now tried up to batch 128 (tiles that overflow shared memory
+  just fail to compile during tuning and are skipped).
+- Tuning budget is sliced per role so the producers cannot starve the rest.
+- LOOKAHEAD back to 3 after the first token (v3 used 2 and B4/B16 TPOT drifted
+  +2%; the first-token ramp already protects TTFT).
