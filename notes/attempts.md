@@ -5,7 +5,7 @@ workloads. Fill in the numbers from the run page.
 
 | # | Commit | Change | Score (tok/s) | Pass? | Notes |
 |---|--------|--------|---------------|-------|-------|
-| 0 | 186912a | Baseline (Transformers, unchanged) | _pending_ | | |
+| 0 | 186912a | Baseline (Transformers, unchanged) | _hidden score?_ | yes | samples below |
 | 1 | _tbd_ | v1: hand-rolled forward, static KV cache, CUDA-graph decode, fused Triton kernels | | | |
 
 ## v1 design (branch `fast-engine`)
@@ -23,3 +23,14 @@ workloads. Fill in the numbers from the run page.
 
 What to read in the run log: `[engine] kernels: ...` (which kernels are live),
 `graph=yes`, and per-shape setup time.
+
+## Baseline sample cases (run 0)
+
+| Workload | TPS | Batch time | TTFT | TPOT | Memory |
+|---|---:|---:|---:|---:|---:|
+| B1 512->32 | 39.5 | 811 ms | 29.8 ms | 25.2 ms | 9.57 GiB |
+| B4 2048->32 | 115.6 | 1107 ms | 202.6 ms | 29.2 ms | 11.44 GiB |
+| B16 512->128 | 582.8 | 3514 ms | 191.7 ms | 26.2 ms | 11.44 GiB |
+
+TPOT is ~25-29 ms at every batch size: decode is pure launch overhead
+(the weight read alone is ~3 ms). Prefill is ~30 ms (B1) to ~200 ms (B4x2048).
