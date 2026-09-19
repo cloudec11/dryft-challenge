@@ -7,7 +7,8 @@ workloads. Fill in the numbers from the run page.
 |---|--------|--------|---------------|-------|-------|
 | 0 | 186912a | Baseline (Transformers, unchanged) | _hidden score?_ | yes | samples below |
 | 1 | 5aed25f | v1: hand-rolled forward, static KV cache, CUDA-graph decode, fused Triton kernels | 855.3 | yes | official run c0c37a87, leaderboard #25; samples below |
-| 2 | _tbd_ | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | | | |
+| 2 | daedece | v2: fused skinny-GEMM decode step (6 launches/layer), GQA flash prefill, row qkv_post, 3-step lookahead | 882.2 | yes | official run 4e9a638e, +3.1% over v1 |
+| 3 | _tbd_ | v3: prefill CUDA graph (<=4096 tok), single-row GEMV kernel for B1, lookahead 1 before first token | | | |
 
 ## v1 design (branch `fast-engine`)
 
@@ -95,3 +96,40 @@ per-role `best ... GB/s` lines, `fused step vs v1: max|dlogit|=...`,
 
 Expected (if fused wins at ~3.4 ms/step and prefill gets ~8%): B1 ~118 ms,
 B4 ~245 ms, B16 ~610 ms, i.e. ~+20% score.
+
+## v2 sample cases (run 2, official 4e9a638e) - score 882.15
+
+| Workload | TPS | Batch time | TTFT | TPOT | Memory | vs v1 total |
+|---|---:|---:|---:|---:|---:|---:|
+| B1 512->32 | 212.8 | 150.4 ms | 19.21 ms | 4.25 ms | 10.23 GiB | +2.1% slower |
+| B4 2048->32 | 475.1 | 269.4 ms | 118.35 ms | 4.86 ms | 12.57 GiB | -5.4% |
+| B16 512->128 | 2813.4 | 727.9 ms | 105.65 ms | 4.89 ms | 12.83 GiB | -2.9% |
+
+Sample spread 0.5-0.6% (gate is 25%). Native ratios: TTFT 0.44-0.58x,
+TPOT 0.12x. Device confirmed: **NVIDIA H100 80GB HBM3** (SXM, ~3.35 TB/s),
+driver 580.95.05, gVisor sandbox, harness 0.2.0.
+
+What we learned:
+
+1. Prefill work paid off: TTFT -12% (B4), -14% (B16).
+2. Decode barely moved (4.25 vs 4.29 ms), so the fused step either lost the
+   warmup race or failed its logit check. **Official runs hide engine stdout
+   and the API only accepts mode=official** (CreateRunBody pins it), so the
+   `[engine]` lines are never visible: iterate on metrics alone.
+3. B1 TTFT regressed 14.4 -> 19.2 ms. The only B1-specific change is the
+   3-step lookahead, so a graph launch appears to cost the CPU ~2.4 ms here
+   (~370 nodes, gVisor). B4/B16 hid those launches behind a long prefill.
+   Corollary: a short eager prefill (~430 launches) is probably launch-bound
+   too, which is why v3 graphs it.
+
+## v3 changes
+
+- Queue one decode step before the first token, two afterwards (LOOKAHEAD=2).
+- CUDA-graph the prefill when batch * prompt <= 4096 tokens, over a static
+  prompt buffer; longer prefills stay eager (GPU-bound, and their activations
+  would sit in a permanent graph pool).
+- Add `_gemv_vec_kernel`: at batch 1 the tile kernel pads a single row to 16
+  for tl.dot; the new one does plain FP32 FMA into a [BLOCK_N, BLOCK_K]
+  accumulator. Tried first at B1, tile kernel still tried as a fallback.
+- Sum-of-squares buffers grow to 1024 partials (BLOCK_N can now be 4) and the
+  norm-in consumers are tuned after the producers so PARTS matches.

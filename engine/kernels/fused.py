@@ -27,7 +27,7 @@ import triton.language as tl
 
 from kernels.ops import _decode_attn_reduce_kernel
 
-SSQ_PARTS = 256  # >= producer programs (hidden 2560 / smallest BLOCK_N 16)
+SSQ_PARTS = 1024  # rows of the sum-of-squares buffers: >= producer programs (2560 / BLOCK_N 4)
 
 
 @triton.jit
@@ -37,8 +37,9 @@ def _gemv_kernel(
     res_ptr, ssq_out_ptr,
     NORM_IN: tl.constexpr, GLU: tl.constexpr, RES_OUT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    PARTS: tl.constexpr,
+    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr,
 ):
+    # Tensor-core tile version: x is padded to BLOCK_M >= 16 rows for tl.dot.
     pid = tl.program_id(0)
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < M
@@ -48,8 +49,8 @@ def _gemv_kernel(
 
     if NORM_IN:
         offs_p = tl.arange(0, PARTS)
-        ss = tl.load(ssq_in_ptr + offs_p[:, None] * BLOCK_M + offs_m[None, :],
-                     mask=offs_p[:, None] < n_parts_in, other=0.0)
+        ss = tl.load(ssq_in_ptr + offs_p[:, None] * SS_STRIDE + offs_m[None, :],
+                     mask=(offs_p[:, None] < n_parts_in) & m_mask[None, :], other=0.0)
         rstd = tl.math.rsqrt(tl.sum(ss, axis=0) / K + eps)
 
     x_ptrs = x_ptr + offs_m[:, None] * K + offs_k[None, :]
@@ -86,47 +87,126 @@ def _gemv_kernel(
         h = (r + d).to(dt)
         tl.store(res_ptr + offs_mn, h, mask=m_mask[:, None])
         hf = tl.where(m_mask[:, None], h.to(tl.float32), 0.0)
-        tl.store(ssq_out_ptr + pid * BLOCK_M + offs_m, tl.sum(hf * hf, axis=1))
+        tl.store(ssq_out_ptr + pid * SS_STRIDE + offs_m, tl.sum(hf * hf, axis=1), mask=m_mask)
     else:
         tl.store(out_ptr + offs_mn, acc.to(dt), mask=m_mask[:, None])
 
 
-class GemvConfig:
-    __slots__ = ("bn", "bk", "stages", "warps")
+@triton.jit
+def _gemv_vec_kernel(
+    x_ptr, w_ptr, out_ptr, N, K,
+    nw_ptr, ssq_in_ptr, n_parts_in, eps,
+    res_ptr, ssq_out_ptr,
+    NORM_IN: tl.constexpr, GLU: tl.constexpr, RES_OUT: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr,
+):
+    # Single-row version (batch 1): plain FMA into a [BLOCK_N, BLOCK_K] FP32
+    # accumulator, reduced once at the end. No padding to 16 rows, no
+    # tensor-core layout conversions; the loop is just wide weight loads.
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    dt = w_ptr.dtype.element_ty
 
-    def __init__(self, bn, bk, stages, warps):
-        self.bn, self.bk, self.stages, self.warps = bn, bk, stages, warps
+    if NORM_IN:
+        offs_p = tl.arange(0, PARTS)
+        ss = tl.load(ssq_in_ptr + offs_p * SS_STRIDE, mask=offs_p < n_parts_in, other=0.0)
+        rstd = tl.math.rsqrt(tl.sum(ss, axis=0) / K + eps)
+
+    w_ptrs = w_ptr + offs_n[:, None].to(tl.int64) * K + offs_k[None, :]
+    acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    if GLU:
+        wu_ptrs = w_ptrs + N.to(tl.int64) * K
+        acc_u = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        x = tl.load(x_ptr + k0 + offs_k)
+        if NORM_IN:
+            nw = tl.load(nw_ptr + k0 + offs_k).to(tl.float32)
+            xn = (x.to(tl.float32) * rstd).to(dt)
+            x = (nw * xn.to(tl.float32)).to(dt)
+        xf = x.to(tl.float32)
+        w = tl.load(w_ptrs)
+        acc += w.to(tl.float32) * xf[None, :]
+        if GLU:
+            wu = tl.load(wu_ptrs)
+            acc_u += wu.to(tl.float32) * xf[None, :]
+            wu_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K
+
+    y = tl.sum(acc, axis=1)
+    if GLU:
+        g = y.to(dt).to(tl.float32)
+        u = tl.sum(acc_u, axis=1).to(dt).to(tl.float32)
+        a = (g / (1.0 + tl.exp(-g))).to(dt).to(tl.float32)
+        tl.store(out_ptr + offs_n, (a * u).to(dt))
+    elif RES_OUT:
+        r = tl.load(res_ptr + offs_n).to(tl.float32)
+        h = (r + y.to(dt).to(tl.float32)).to(dt)
+        tl.store(res_ptr + offs_n, h)
+        hf = h.to(tl.float32)
+        tl.store(ssq_out_ptr + pid * SS_STRIDE, tl.sum(hf * hf, axis=0))
+    else:
+        tl.store(out_ptr + offs_n, y.to(dt))
+
+
+class GemvConfig:
+    __slots__ = ("bn", "bk", "stages", "warps", "vec")
+
+    def __init__(self, bn, bk, stages, warps, vec=False):
+        self.bn, self.bk, self.stages, self.warps, self.vec = bn, bk, stages, warps, vec
 
     def __repr__(self):
-        return f"{self.bn}x{self.bk}s{self.stages}w{self.warps}"
+        return f"{'vec' if self.vec else 'mma'}{self.bn}x{self.bk}s{self.stages}w{self.warps}"
 
 
 # Tried per projection during warmup; the fastest one that compiles wins.
+# Batch 1 tries the single-row kernel first, then the tile kernel.
+GEMV_VEC_CANDIDATES = (
+    GemvConfig(8, 512, 2, 4, vec=True),
+    GemvConfig(4, 512, 2, 4, vec=True),
+    GemvConfig(16, 256, 2, 4, vec=True),
+    GemvConfig(16, 512, 2, 8, vec=True),
+)
 GEMV_CANDIDATES = (
     GemvConfig(16, 256, 3, 4),
     GemvConfig(16, 512, 3, 4),
     GemvConfig(32, 256, 3, 4),
     GemvConfig(32, 128, 4, 4),
     GemvConfig(64, 128, 4, 4),
-    GemvConfig(16, 128, 5, 4),
     GemvConfig(64, 256, 3, 8),
 )
 
 
+def candidates(m):
+    return (GEMV_VEC_CANDIDATES + GEMV_CANDIDATES[:3]) if m == 1 else GEMV_CANDIDATES
+
+
 def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
-         norm_w=None, n_parts=1, res=None, glu=False):
+         norm_w=None, n_parts=1, res=None, glu=False, parts_block=SSQ_PARTS):
     """``x[:m] @ w.T`` into ``out`` (or into ``res`` in place when ``res`` is
     given), with the fusions described above. ``ssq_in``/``ssq_out`` are
     ``[SSQ_PARTS, block_m]`` FP32 buffers and are always passed, even when
-    unused, so every call site compiles to the same signature."""
+    unused, so every call site compiles to the same signature.
+    ``parts_block`` is a power of two >= ``n_parts``."""
     norm_in = norm_w is not None
     res_out = res is not None
+    dst = res if res_out else out
+    nw = norm_w if norm_in else w
+    if cfg.vec:
+        assert m == 1
+        _gemv_vec_kernel[(n // cfg.bn,)](
+            x, w, dst, n, k, nw, ssq_in, n_parts, eps, dst, ssq_out,
+            NORM_IN=norm_in, GLU=glu, RES_OUT=res_out,
+            BLOCK_N=cfg.bn, BLOCK_K=cfg.bk, PARTS=parts_block, SS_STRIDE=block_m,
+            num_warps=cfg.warps, num_stages=cfg.stages,
+        )
+        return
     _gemv_kernel[(n // cfg.bn,)](
-        x, w, res if res_out else out, m, n, k,
-        norm_w if norm_in else w, ssq_in, n_parts, eps,
-        res if res_out else out, ssq_out,
+        x, w, dst, m, n, k, nw, ssq_in, n_parts, eps, dst, ssq_out,
         NORM_IN=norm_in, GLU=glu, RES_OUT=res_out,
-        BLOCK_M=block_m, BLOCK_N=cfg.bn, BLOCK_K=cfg.bk, PARTS=SSQ_PARTS,
+        BLOCK_M=block_m, BLOCK_N=cfg.bn, BLOCK_K=cfg.bk,
+        PARTS=parts_block, SS_STRIDE=block_m,
         num_warps=cfg.warps, num_stages=cfg.stages,
     )
 
