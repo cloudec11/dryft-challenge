@@ -131,9 +131,19 @@ WARMUP_BUDGET_S = 255.0
 # not: the fused step's check against the reference, the decode graph capture,
 # and the warmup generation the platform is timing this budget against.
 RESERVE_S = 35.0
-# Below this much left, the fused step is not even checked -- the check and
-# its race are two graph captures and six eager steps.
+# Below this much left, a plan is not even checked -- a check is a prefill
+# and six eager steps, and its race is a graph capture.
 FUSED_CHECK_S = 22.0
+# How far below the reference step's argmax the fused step's own choice may
+# sit before the plan is rejected.  The judge allows 2.0 and native Qwen
+# drifts 0.75 against itself, so this is four times stricter than the rule it
+# is protecting -- but it is not zero, because a genuine near-tie is not a
+# wiring bug and rejecting one costs the whole workload the fused step.
+TIE_OK = 0.5
+# A plan raced against another plan, end to end, on the same device in the
+# same second.  Tighter than MARGIN because there is no between-run noise in
+# it, looser than TILE_MARGIN because being wrong here costs the whole step.
+PLAN_MARGIN = 0.99
 TUNE_BUDGET_S = 70.0
 ATTN_TUNE_BUDGET_S = 25.0
 CAND_LIMIT = 6
@@ -208,7 +218,6 @@ class ShapePlan:
         self.graph = None
         self.prefill_graph = None
         self.step = None
-        self.fast_ok = False
 
         # Prefill working set.  The row-wise stages run in chunks so the MLP's
         # activations do not scale with batch times prompt.
@@ -1106,25 +1115,20 @@ class Engine:
         """Seconds left of the load-plus-warmup budget."""
         return WARMUP_BUDGET_S - (time.perf_counter() - self.started)
 
-    def _fill_incumbent_tiles(self, st):
-        """Give every unplanned role the tile v1 through v12 all ran.
+    def _incumbent_plan(self, st):
+        """The tile v1 through v12 all ran, for every role.
 
         It divides every one of this checkpoint's dimensions, it leaves 160
         partials for the two producing roles against a 256-row hand-off
         buffer, and it needs no split-K -- so it is legal without being
         checked, which is the point of having it.
         """
+        plan = {}
         for role in ROLES:
-            if role in st.tiles:
-                continue
-            cached = self.tile_cache.get((st.batch, role))
-            if cached is not None:
-                st.tiles[role] = cached
-                continue
             n, k, _, glu, _ = self.w.role_dims(role)
             incumbent = planner.Tile(st.block_m, 16, 256)
             if n % incumbent.bn == 0 and k % incumbent.bk == 0:
-                st.tiles[role] = incumbent
+                plan[role] = incumbent
                 continue
             # Not this checkpoint, then.  Take the model's first choice
             # unmeasured rather than launch a tile that does not divide.
@@ -1134,7 +1138,20 @@ class Engine:
                 max_parts=SSQ_PARTS if role in ("o", "down") else None,
                 partial_capacity=st.partial_capacity)
             if picks:
-                st.tiles[role] = picks[0]
+                plan[role] = picks[0]
+        return plan
+
+    def _fill_incumbent_tiles(self, st):
+        """Plan whatever the tuner did not get to, without measuring it."""
+        fallback = self._incumbent_plan(st)
+        for role in ROLES:
+            if role in st.tiles:
+                continue
+            cached = self.tile_cache.get((st.batch, role))
+            if cached is not None:
+                st.tiles[role] = cached
+            elif role in fallback:
+                st.tiles[role] = fallback[role]
         _log(f"tiles: {len(st.tiles)} roles planned, "
              f"{self._remaining():.0f}s of budget left")
 
@@ -1152,45 +1169,100 @@ class Engine:
             return False
 
     def _adopt_fast_step(self, st):
-        """Take the fused step only if it agrees with the cuBLAS step and is
-        faster than it.  Both halves matter: agreement is correctness, and the
-        race is what stops a plan that looked good in the model from costing a
-        run."""
-        if not self._check_fast(st):
-            _log("fused step rejected: logits disagree with the reference step")
-            return
-        st.fast_ok = True
+        """Choose the decode step by measuring whole steps, not whole roles.
+
+        A per-role race times one projection over 36 layers with nothing else
+        running, which is not the state that projection meets inside a step:
+        between two of its launches the step streams a layer's weights and its
+        whole KV cache past the same L2. So the role races propose and this
+        disposes -- the tuned plan has to beat the tile every engine since v1
+        has run, end to end, on the real shape, or it does not ship.
+
+        Both are checked for agreement first, and a plan that fails its check
+        hands over to the next one rather than to cuBLAS: falling all the way
+        back costs more than any tile choice can.
+        """
         base = st.prompt_len
 
         def reset():
             st.pos.fill_(base)
 
+        tuned = dict(st.tiles)
+        incumbent = self._incumbent_plan(st)
+        plans = []
+        if (all(role in incumbent for role in ROLES)
+                and any(incumbent[role].key != tuned[role].key for role in tuned)):
+            plans.append(("incumbent", incumbent))  # first: it wins ties
+        plans.append(("tuned", tuned))
+
+        timings, kept = [], {}
+        for name, tiles in plans:
+            if timings and self._remaining() < FUSED_CHECK_S:
+                break
+            st.tiles = dict(tiles)
+            if not self._guard(self._require_agreement, f"plan {name}", st):
+                continue
+            try:
+                graph = self._graph_of(lambda: self._step_fast(st), before=reset)
+            except Exception as exc:
+                torch.cuda.synchronize()
+                _log(f"plan {name} would not capture: "
+                     f"{type(exc).__name__}: {str(exc)[:160]}")
+                continue
+            timings.append((name, self._time_replays(graph, before=reset) / 1e3))
+            kept[name] = tiles
+            del graph
+        if not timings:
+            st.tiles = tuned
+            st.step = self._step_safe
+            _log("no plan agreed with the reference step; decoding through cuBLAS")
+            return
+
+        choice, fast_s = self._race(timings, f"decode plan B={st.batch}",
+                                    margin=PLAN_MARGIN)
+        st.tiles = dict(kept[choice])
         safe = self._graph_of(lambda: self._step_safe(st), before=reset)
-        fast = self._graph_of(lambda: self._step_fast(st), before=reset)
-        timings = [("reference", self._time_replays(safe, before=reset) / 1e3),
-                   ("fused", self._time_replays(fast, before=reset) / 1e3)]
-        del safe, fast
-        choice, _ = self._race(timings, f"decode step B={st.batch}")
-        st.step = self._step_fast if choice == "fused" else self._step_safe
-        st.pos.fill_(base)
+        safe_s = self._time_replays(safe, before=reset) / 1e3
+        del safe
+        winner, _ = self._race([("reference", safe_s), ("fused", fast_s)],
+                               f"decode step B={st.batch}")
+        st.step = self._step_fast if winner == "fused" else self._step_safe
+        reset()
+
+    def _require_agreement(self, st):
+        """``_check_fast`` as something ``_guard`` can wrap: a plan that
+        disagrees raises, so a plan that raises and a plan that disagrees take
+        the same path."""
+        if not self._check_fast(st):
+            raise RuntimeError("logits disagree with the reference step")
 
     def _check_fast(self, st):
-        """Run both steps from the same state and compare the logits.
+        """Run both steps from the same state and compare what they emit.
+
+        The state is a real one.  An earlier version of this filled the KV
+        cache with noise and compared logits against an absolute threshold,
+        which is a worse test in both directions: the model is far out of
+        distribution, so its logits are larger and two implementations that
+        differ only in BF16 rounding drift further apart in absolute terms --
+        and the run reports agree, because the engine scored what its cuBLAS
+        step alone is worth.  A prefill of random token ids is both closer to
+        what the judge sends and a better-conditioned comparison, and it costs
+        a hundred milliseconds of a budget that has minutes in it.
 
         Three steps, not one: the hand-off buffers alternate between layers
         and between steps, so a wiring error that only appears on the second
         layer of the second step is exactly what this has to catch.
 
-        The two runs share the cache rather than a copy of it.  Each run
-        writes slots ``base`` onward and reads ``[0, pos]``; the slots below
-        ``base`` are the random state both runs start from and neither one
-        touches, and the slots at and above it each run fills itself.
+        The two runs share the cache rather than a copy of it.  Each writes
+        slots ``base`` onward and reads ``[0, pos]``; the slots below ``base``
+        are the prefill both runs start from and neither one touches.
         """
         w = self.w
         base = st.prompt_len
-        st.k_cache.normal_(0.0, 0.1)
-        st.v_cache.normal_(0.0, 0.1)
-        seed_ids = torch.randint(0, w.vocab, (st.batch,), device=self.device)
+        st.pre_ids.copy_(torch.randint(0, w.vocab, (st.batch, st.prompt_len),
+                                       device=self.device))
+        self._prefill(st)
+        seed_ids = st.ids.clone()
 
         def run(step):
             st.ids.copy_(seed_ids)
@@ -1205,16 +1277,22 @@ class Engine:
         got = run(self._step_fast)
         st.pos.fill_(base)
         worst = 0.0
-        for i, (a, b) in enumerate(zip(got, ref)):
+        shortfall = 0.0
+        for a, b in zip(got, ref):
             if not torch.isfinite(a).all():
-                _log("fused step rejected: non-finite logits")
+                _log("plan rejected: non-finite logits")
                 return False
             worst = max(worst, float((a.float() - b.float()).abs().max()))
-            if i == 0 and not bool((a.argmax(-1) == b.argmax(-1)).all()):
-                _log("fused step rejected: first token differs")
-                return False
-        _log(f"fused vs reference step: max|dlogit| = {worst:.3f}")
-        return worst <= 1.0
+            # What the judge would ask: the token this step would emit, scored
+            # against the reference's own best. A near-tie flip is allowed and
+            # does not cascade, because the replay follows the emitted prefix.
+            chosen = b.float().gather(1, a.argmax(-1, keepdim=True))
+            shortfall = max(shortfall, float((b.float().max(-1, keepdim=True).values
+                                              - chosen).max()))
+        ok = worst <= 1.0 and shortfall <= TIE_OK
+        _log(f"plan vs reference step: max|dlogit| = {worst:.3f}, "
+             f"token shortfall = {shortfall:.3f}, {'accepted' if ok else 'rejected'}")
+        return ok
 
     def _capture_decode(self, st):
         base = st.prompt_len

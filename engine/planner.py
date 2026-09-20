@@ -31,7 +31,10 @@ to move bytes, and there are four kinds:
               ``BLOCK_N = 16`` tile that v1 through v11 ran, this term is
               6.25 GB per step against 8.05 GB of weights.
 ``partials``  ``split`` FP32 copies of the output, written and read back,
-              when K is split.  Also L2-resident and also not free.
+              when K is split.  Charged at the full HBM price, not the L2
+              one: it is megabytes, and between the write and the read the
+              same kernel streams up to a hundred megabytes of weights past
+              the same cache.  x survives that; this does not.
 ``output``    ``m * n * 2`` bytes, negligible, counted anyway.
 
 Widening ``BLOCK_N`` divides the x term, and it also divides the number of
@@ -264,8 +267,9 @@ def traffic(tile, m, n, k, glu, dev, parts=0):
     # A GLU role streams two weight blocks but writes one output: the
     # epilogue multiplies them together before it stores.
     out_bytes = m * n * 2
-    l2_bytes = x_bytes + p_bytes + s_bytes
-    return w_bytes, l2_bytes, w_bytes + dev.l2_cost * l2_bytes + out_bytes
+    l2_bytes = x_bytes + s_bytes
+    stream = w_bytes + p_bytes + out_bytes
+    return w_bytes, l2_bytes, stream + dev.l2_cost * l2_bytes
 
 
 def starvation(tile, k, glu, occupancy):
@@ -462,11 +466,12 @@ def fit_l2_cost(narrow, wide, m, n, k, glu, dev):
     computes it and dividing one by the other gives one equation in one
     unknown:
 
-        c = W (1 - R) / (R * l_wide - l_narrow),   R = busy_n en / busy_w ew
+        c = (S_n - R S_w) / (R * l_wide - l_narrow),   R = busy_n en / busy_w ew
 
-    where ``W`` is the traffic both tiles share and ``busy`` is the measured
-    time with the launch charge removed and the starvation factor divided
-    out.  The bandwidth then falls out of either measurement.
+    where ``S`` is each tile's streamed traffic -- weights, partials and the
+    output, all charged at the HBM price -- and ``busy`` is the measured time
+    with the launch charge removed and the starvation factor divided out.
+    The bandwidth then falls out of either measurement.
 
     Returns ``(bw, l2_cost)``; either may be ``None`` when the pair does not
     separate the two terms well enough to be worth believing.
@@ -487,20 +492,25 @@ def fit_l2_cost(narrow, wide, m, n, k, glu, dev):
     if busy_n <= 0 or busy_w <= 0:
         return None, None
 
-    # Traffic that does not depend on the unknown: weights plus the output.
-    shared = n * k * 2 * (2 if glu else 1) + m * n * 2
-    _, ln, _ = traffic(tn, m, n, k, glu, dev)
-    _, lw, _ = traffic(tw, m, n, k, glu, dev)
+    # Traffic that does not depend on the unknown.  It is not the same for
+    # both tiles once one of them splits: the partials are charged at the
+    # stream price, so they belong on this side of the equation.
+    def split_terms(tile):
+        _, l2_bytes, eff = traffic(tile, m, n, k, glu, dev)
+        return l2_bytes, eff - dev.l2_cost * l2_bytes
+
+    ln, sn = split_terms(tn)
+    lw, sw = split_terms(tw)
     ratio = (busy_n * en) / (busy_w * ew)
 
     l2_cost = None
     denom = ratio * lw - ln
     if abs(denom) > 0.05 * max(ln, 1.0):
-        candidate = shared * (1.0 - ratio) / denom
+        candidate = (sn - ratio * sw) / denom
         if math.isfinite(candidate) and 0.0 < candidate <= 1.0:
             l2_cost = candidate
     price = l2_cost if l2_cost is not None else dev.l2_cost
-    bw = (shared + price * lw) / (busy_w * ew)
+    bw = (sw + price * lw) / (busy_w * ew)
     return bw, l2_cost
 
 

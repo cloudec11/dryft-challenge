@@ -85,22 +85,28 @@ def _epilogue(
 
 @triton.jit
 def _rstd_from_parts(ssq_in_ptr, offs_m, m_mask, n_parts, K, eps,
-                     BLOCK_M: tl.constexpr, SS_STRIDE: tl.constexpr):
+                     BLOCK_M: tl.constexpr, PART_STEPS: tl.constexpr,
+                     SS_STRIDE: tl.constexpr):
     """Finish the RMSNorm the previous kernel started.
 
     The producer left one partial sum of squares per column tile; the sum is
     over the whole row, so the partials are added before the K slice is taken.
     Every role that normalises has ``K = hidden``, which is the dimension
-    Qwen3RMSNorm reduces over.  The partial count is a runtime value, so the
-    loop is too -- which also keeps the kernel to one specialisation however
-    many partials the producer's tile happens to leave.
+    Qwen3RMSNorm reduces over.
+
+    The trip count is a constexpr, so the loop unrolls and the loads issue
+    together.  It was a runtime loop once, to keep the kernel to a single
+    specialisation -- but this runs in the prologue of every program of three
+    of the five roles, ahead of the weight stream it is holding up, and the
+    producer's partial count takes one of three values in a whole run.
     """
     offs_p = tl.arange(0, PART_CHUNK)
     total = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    for p0 in range(0, n_parts, PART_CHUNK):
+    for step in tl.static_range(PART_STEPS):
+        offs = step * PART_CHUNK + offs_p
         ss = tl.load(
-            ssq_in_ptr + (p0 + offs_p)[:, None] * SS_STRIDE + offs_m[None, :],
-            mask=((p0 + offs_p)[:, None] < n_parts) & m_mask[None, :], other=0.0,
+            ssq_in_ptr + offs[:, None] * SS_STRIDE + offs_m[None, :],
+            mask=(offs[:, None] < n_parts) & m_mask[None, :], other=0.0,
         )
         total += tl.sum(ss, axis=0)
     return tl.math.rsqrt(total / K + eps)
@@ -113,7 +119,7 @@ def _proj_kernel(
     NORM: tl.constexpr, GLU: tl.constexpr, RES: tl.constexpr,
     SPLIT: tl.constexpr, FIXUP: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    SS_STRIDE: tl.constexpr,
+    PART_STEPS: tl.constexpr, SS_STRIDE: tl.constexpr,
 ):
     """``y = x[:M] @ w.T`` for one tile of output columns and one slice of K.
 
@@ -133,7 +139,8 @@ def _proj_kernel(
 
     if NORM:
         rstd = _rstd_from_parts(ssq_in_ptr, offs_m, m_mask, n_parts, K, eps,
-                                BLOCK_M=BLOCK_M, SS_STRIDE=SS_STRIDE)
+                                BLOCK_M=BLOCK_M, PART_STEPS=PART_STEPS,
+                                SS_STRIDE=SS_STRIDE)
 
     x_ptrs = x_ptr + offs_m[:, None].to(tl.int64) * K + k_start + offs_k[None, :]
     # A [BLOCK_K, BLOCK_N] window on W[N, K] (K contiguous), so acc += x @ W.T
@@ -236,7 +243,8 @@ def _proj_vec_kernel(
     x_ptr, w_ptr, y_ptr, res_ptr, ssq_in_ptr, ssq_out_ptr, nw_ptr,
     N, K, n_parts, eps,
     NORM: tl.constexpr, GLU: tl.constexpr, RES: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SS_STRIDE: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PART_STEPS: tl.constexpr,
+    SS_STRIDE: tl.constexpr,
 ):
     """Batch-1 specialisation: FP32 FMA into a ``[BLOCK_N, BLOCK_K]``
     accumulator, reduced once at the end.
@@ -253,9 +261,10 @@ def _proj_vec_kernel(
     if NORM:
         offs_p = tl.arange(0, PART_CHUNK)
         total = 0.0
-        for p0 in range(0, n_parts, PART_CHUNK):
-            ss = tl.load(ssq_in_ptr + (p0 + offs_p) * SS_STRIDE,
-                         mask=(p0 + offs_p) < n_parts, other=0.0)
+        for step in tl.static_range(PART_STEPS):
+            offs = step * PART_CHUNK + offs_p
+            ss = tl.load(ssq_in_ptr + offs * SS_STRIDE, mask=offs < n_parts,
+                         other=0.0)
             total += tl.sum(ss, axis=0)
         rstd = tl.math.rsqrt(total / K + eps)
 
@@ -336,12 +345,13 @@ def project(x, w, y, m, n, k, tile, ssq_in, ssq_out, eps, *, norm_w=None,
     norm = norm_w is not None
     if n % tile.bn or k % tile.bk or k % tile.split:
         raise ValueError(f"tile {tile} does not divide n={n} k={k}")
+    part_steps = -(-n_parts // PART_CHUNK) if norm else 1
     if tile.kind == "vec":
         _proj_vec_kernel[(n // tile.bn,)](
             x, w, y, res, ssq_in, ssq_out, norm_w, n, k, n_parts, eps,
             NORM=norm, GLU=glu, RES=res is not None,
-            BLOCK_N=tile.bn, BLOCK_K=tile.bk, SS_STRIDE=ss_stride,
-            num_warps=tile.warps, num_stages=tile.stages,
+            BLOCK_N=tile.bn, BLOCK_K=tile.bk, PART_STEPS=part_steps,
+            SS_STRIDE=ss_stride, num_warps=tile.warps, num_stages=tile.stages,
         )
         return
 
@@ -353,7 +363,8 @@ def project(x, w, y, m, n, k, tile, ssq_in, ssq_out, eps, *, norm_w=None,
         m, n, k, part_s_stride, n_parts, eps,
         NORM=norm, GLU=glu, RES=res is not None,
         SPLIT=tile.split, FIXUP=tile.fixup,
-        BLOCK_M=tile.bm, BLOCK_N=tile.bn, BLOCK_K=tile.bk, SS_STRIDE=ss_stride,
+        BLOCK_M=tile.bm, BLOCK_N=tile.bn, BLOCK_K=tile.bk,
+        PART_STEPS=part_steps, SS_STRIDE=ss_stride,
         num_warps=tile.warps, num_stages=tile.stages,
     )
     if tile.split > 1 and not tile.fixup:
