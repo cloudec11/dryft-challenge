@@ -75,15 +75,16 @@ EPS = 1e-6
 FAILURES = []
 
 
-def check(name, got, want, tol=0.02):
+def check(name, got, want, tol=0.02, quiet=False):
     got = torch.as_tensor(np.asarray(got, dtype=np.float32))
     want = want.float()
     err = (got - want).abs().max().item()
     scale = max(want.abs().max().item(), 1e-6)
     ok = err <= tol * scale
-    print(f"  {'ok  ' if ok else 'FAIL'} {name}: max|d|={err:.4g} scale={scale:.4g}")
-    if not ok:
-        FAILURES.append(name)
+    if not quiet:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}: max|d|={err:.4g} scale={scale:.4g}")
+        if not ok:
+            FAILURES.append(name)
 
 
 def bf(*shape, scale=1.0, gen=None):
@@ -157,7 +158,7 @@ def reference(h, ws, kc, vc, pos, cos, sin, dims):
     return h3, attn, act, kc, vc
 
 
-def case(splits, block_n):
+def case(splits, block_n, grid=1, quiet=False):
     gen = torch.Generator().manual_seed(7)
     nq, nkv, d = 4, 2, 16
     hid, inter = 64, 32
@@ -167,7 +168,6 @@ def case(splits, block_n):
     bm, bk = 16, 16
     bn_qkv, bn_o, bn_gu, bn_dn = 16, 8, 8, 8
     parts = 16
-    grid = 1
 
     ws = {
         "in_w": bf(hid, scale=0.5, gen=gen) + 1,
@@ -187,8 +187,9 @@ def case(splits, block_n):
 
     chunk = -(-cap // splits)
     chunk = -(-chunk // block_n) * block_n
-    print(f"layer kernel on the simulator: one block, {splits} attention"
-          f" split(s), chunk {chunk}")
+    if not quiet:
+        print(f"layer kernel on the simulator: {grid} block(s), {splits} attention"
+              f" split(s), chunk {chunk}")
     want_h, want_attn, want_act, want_kc, want_vc = reference(
         h, ws, kc, vc, pos, cos, sin, {"nq": nq, "nkv": nkv, "d": d})
 
@@ -238,27 +239,52 @@ def case(splits, block_n):
     tlsim.run(klayer, "_layer_kernel", (grid,), args, kwargs,
               jit_names=("_arrive_and_wait",))
 
-    check("residual stream h", hb.reshape(m, hid), want_h)
-    check("attention output", attn_b.reshape(m, k_o), want_attn)
-    check("SwiGLU activation", act_b.reshape(m, inter), want_act)
-    check("K cache", kb.reshape(batch, nkv, cap, d), want_kc)
-    check("V cache", vb.reshape(batch, nkv, cap, d), want_vc)
+    check("residual stream h", hb.reshape(m, hid), want_h, quiet=quiet)
+    check("attention output", attn_b.reshape(m, k_o), want_attn, quiet=quiet)
+    check("SwiGLU activation", act_b.reshape(m, inter), want_act, quiet=quiet)
+    check("K cache", kb.reshape(batch, nkv, cap, d), want_kc, quiet=quiet)
+    check("V cache", vb.reshape(batch, nkv, cap, d), want_vc, quiet=quiet)
     # the sums of squares the next norm consumes, one partial per tile
     got_a = ssq_a[: hid // bn_o, :m].sum(axis=0)
     want_a = (want_h.float() - torch.as_tensor(np.asarray(act_b.reshape(m, inter)))
               .float() @ ws["dn_w"].float().T)
-    check("sum of squares after O", got_a,
-          want_a.pow(2).sum(-1), tol=0.05)
+    check("sum of squares after O", got_a, want_a.pow(2).sum(-1), tol=0.05, quiet=quiet)
     got_b = ssq_b[: hid // bn_dn, :m].sum(axis=0)
-    check("sum of squares after down", got_b, want_h.float().pow(2).sum(-1), tol=0.05)
-    print(f"barrier flags set: {int(flags[:, :grid].sum())} of {6 * grid}")
+    check("sum of squares after down", got_b, want_h.float().pow(2).sum(-1), tol=0.05,
+          quiet=quiet)
+    if not quiet:
+        print(f"barrier flags set: {int(flags[:, :grid].sum())} of {6 * grid}")
 
-    print(f"barriers fired: {int(flags[:, :grid].sum())}")
+
+
+
+def spin_limit_escapes():
+    """The safety valve: a barrier that can never complete must give up.
+
+    The simulator runs programs one after another, so with two blocks the
+    first one waits for a flag the second has not written yet -- exactly the
+    shape of a real deadlock. With SPIN_LIMIT lowered this must return rather
+    than spin forever. The layer's output is meaningless here, which is the
+    point: on the device that is what the logit check sees, instead of a hang
+    burning the 300 s budget and failing every workload."""
+    saved = klayer.SPIN_LIMIT
+    klayer.SPIN_LIMIT = 4
+    try:
+        import time
+        t0 = time.perf_counter()
+        case(1, 8, grid=2, quiet=True)
+        elapsed = time.perf_counter() - t0
+        print(f"  ok   two-block barrier gave up and returned in {elapsed:.2f}s "
+              f"(SPIN_LIMIT={klayer.SPIN_LIMIT}); outputs are expected to be wrong")
+    finally:
+        klayer.SPIN_LIMIT = saved
 
 
 def main():
     case(1, 8)   # one split covers the sequence: reduce stage skipped
     case(2, 4)   # split attention: partials plus the reduce stage
+    print("bounded spin:")
+    spin_limit_escapes()
     if FAILURES:
         print(f"FAILED: {', '.join(sorted(set(FAILURES)))}")
         return 1
