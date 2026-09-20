@@ -16,6 +16,8 @@ workloads. Fill in the numbers from the run page.
 | 9 | 31212d0 | v9: split-K for every projection but the LM head | 883.6 | yes | run 881e52fa; ~2% down everywhere incl. untouched TTFT -> slower machine instance |
 | 10 | _tbd_ | v10: widened exact speculative verification (n-gram drafts) | 900.9 | yes | Statistically flat versus v8's 902.9; inspect spec logs before changing it again. |
 | 11 | _tbd_ | v11: 3-gram → 2-gram backoff proposer, exact verification | | | Isolates proposal quality while restoring the known-good K=3 verifier. |
+| 12 | cc4ca3d | v12: tile scoring on modelled traffic, split-K gated on the candidate's own grid | 898.5 (v11 run) | yes | Diagnosis recorded in `notes/v12-design.md`; never measured on its own. |
+| 13 | _tbd_ | v13: new engine. Calibrated traffic model, split-K reduced inside the launch, offline test suite | | | Design: `notes/v13-design.md`. |
 
 ## v1 design (branch `fast-engine`)
 
@@ -514,3 +516,61 @@ model shifts logits by whole units on some prompt, and one failing position
 fails the whole workload. The 2.0-logit margin was calibrated on BF16
 reduction-order noise, not on representation error. A quantized *draft*
 under exact verification is a different thing and is allowed; see above.
+
+
+## v13: a new engine, and a different way of choosing what it runs
+
+Design note: `notes/v13-design.md`. Every file under `engine/` is new
+(`engine.py`, `model.py`, `planner.py`, `kernels/{gemm,attention,elementwise,
+reference}.py`); nothing from v10-v12 survives there.
+
+Three changes, in the order they matter:
+
+1. **Calibrate, then solve.** The tile space is generated from the device and
+   the role's dimensions and scored by a traffic model whose three constants --
+   achieved bandwidth, launch cost, and the price of an L2 byte -- are measured
+   at warmup. The tuner compiles only the handful the model cannot separate,
+   instead of racing a hand-written shortlist. `l2_cost` is *solved*, not
+   guessed: two tiles that stream identical weights over the same grid differ
+   only in their activation re-read, so dividing their measured times leaves
+   one equation in one unknown.
+2. **The model prices what v12 diagnosed**, plus two terms v12 did not have:
+   the RMSNorm hand-off (every program of a consumer reads all of its
+   producer's partials, so a 16-wide producer bills 3.9 MB a launch) and
+   starvation, so it cannot recommend a tile that moves the fewest bytes and
+   then waits for all of them.
+3. **Split-K reduces inside the same launch.** The last program to finish a
+   column tile folds the FP32 slices itself, in slice order, via an atomic
+   counter with release/acquire ordering -- the CUTLASS last-block-fixup
+   pattern. That removes the 36-launches-per-splitting-role tax (~0.1 ms a
+   role at batch 16, which was most of what splitting won) and lets decode
+   attention be split for parallelism at batch 1 *and* cost one launch, which
+   v6 had to choose between. Checked at load against the two-launch path and
+   dropped if it ever disagrees.
+
+Everything keeps a floor: each kernel is checked against a PyTorch twin at
+load, the fused step is checked against a cuBLAS step at the real shape and
+then has to beat it in a timed race, and the twin attention reads its length
+from the device so the step is capturable even with no Triton at all.
+
+### Offline evidence, since there is no public run any more
+
+33 tests, no GPU: `tests/test_planner.py` (tile legality, buffer bounds,
+calibration round-trip), `tests/test_kernels_sim.py` (the kernels' own source
+run over numpy by `tests/tlsim.py`, against the twins, with BF16 modelled
+exactly enough to distinguish the reference RMSNorm from the formulation the
+contract forbids), and `tests/test_engine_cpu.py` (the engine against
+Transformers' Qwen3 on a tiny model: identical tokens, state reset, judge-style
+replay, generator contract, fused step at batch 1/2/3).
+
+Triton 3.1's own interpreter cannot stand in for the last two: it reads and
+writes through device pointers and returns garbage for CPU tensors.
+
+### What to look for in the run
+
+The model's prediction, at the fallback constants, is a batch-16 step of
+4.20 ms against 6.14 ms for the incumbent tiles, with the LM head the single
+largest item: 778 MB of activation re-reads at `BLOCK_N=16` against 97 MB at
+128, and no split-K needed to keep the device full. If the traffic model is
+right, the three public shapes improve together; if only batch 1 moves, it is
+the launch term and not the traffic term.
