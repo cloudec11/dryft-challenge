@@ -837,3 +837,29 @@ questions now. An hour of H100 time (~$2-3 on RunPod or Lambda) with
 `ncu --set full` on the decode graph answers: why the one-launch kernel does
 not run, and where that 1.46 ms goes. Blind, a run costs ~15 minutes and
 returns three numbers with a 2% error bar.
+
+## v18: the L2 policy of the streams, raced over the whole step
+
+v12 measured that a step issues 14.30 GB of loads to deliver 8.05 GB: the
+extra 6.25 GB is each projection re-reading its `[BLOCK_M, K]` input once per
+column tile. It then cut those re-reads ~4x and gained nothing, concluding
+they are L2 hits that already overlap the HBM stream. **What that experiment
+could not separate is whether they stay hits.** Every one of those 8.05 GB of
+weights, and the ~1.4 GB of KV, flows through the same 50 MB L2 and can evict
+the activations the next tile is about to re-read.
+
+Triton exposes the policy per load, so: weights and KV `evict_first` (read
+once per step, never reused), activations `evict_last` (re-read once per
+column tile). No arithmetic changes - verified in the simulator, both
+policies give bit-identical results.
+
+The race for it has to be **whole-step**, and that is the point. A projection
+timed alone has no competing traffic to protect, so a per-role race cannot
+see this at all - the same blind spot that made v5 pick an L2-resident
+attention tile and v12 trust a byte count. So `_try_stream` captures a second
+whole-step graph with the policies on, times both, and keeps the winner by
+the usual 3% margin.
+
+If it does nothing, that is informative too: it would mean the activation
+re-reads are not just non-stalling but genuinely free, and the remaining
+~1.46 ms is per-kernel ramp rather than anything about L2.

@@ -175,6 +175,7 @@ class _FusedPlan:
         self.ssq_a = torch.zeros((fused.SSQ_PARTS, self.bm), dtype=torch.float32, device=dev)
         self.ssq_b = torch.zeros_like(self.ssq_a)
         self.cfg = {}
+        self.stream = False  # L2 policy for weight/KV loads; raced whole-step
         self.parts_o = self.parts_down = 0
         self.parts_block = fused.SSQ_PARTS
 
@@ -495,18 +496,19 @@ class Engine:
         parts = 1
         for i, layer in enumerate(self.layers):
             fused.gemv(f.h, layer.qkv, f.qkv, m, f.n_qkv, hid, c["qkv"], bm, b_buf, a_buf, eps,
-                       norm_w=layer.in_w, n_parts=parts, parts_block=pb)
+                       norm_w=layer.in_w, n_parts=parts, parts_block=pb, stream=f.stream)
             a = fused.attention_fused(st.attn, f.qkv, layer.q_norm, layer.k_norm, self.cos,
                                       self.sin, st.pos, st.k_cache[i], st.v_cache[i], eps)
             fused.gemv(a, layer.o, None, m, hid, f.k_o, c["o"], bm, b_buf, a_buf, eps, res=f.h,
-                       parts_block=pp, part=f.part)
+                       parts_block=pp, part=f.part, stream=f.stream)
             fused.gemv(f.h, layer.gate_up, f.act, m, f.inter, hid, c["gate_up"], bm, a_buf, b_buf,
-                       eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True, parts_block=pb)
+                       eps, norm_w=layer.post_w, n_parts=f.parts_o, glu=True, parts_block=pb,
+                       stream=f.stream)
             fused.gemv(f.act, layer.down, None, m, hid, f.inter, c["down"], bm, a_buf, b_buf, eps,
-                       res=f.h, parts_block=pp, part=f.part)
+                       res=f.h, parts_block=pp, part=f.part, stream=f.stream)
             parts = f.parts_down
         fused.gemv(f.h, self.lm_w, f.logits, m, f.vocab, hid, c["lm"], bm, b_buf, a_buf, eps,
-                   norm_w=self.norm_w, n_parts=parts, parts_block=pb)
+                   norm_w=self.norm_w, n_parts=parts, parts_block=pb, stream=f.stream)
         self._argmax_into(f.logits, st.ids)
         st.pos.add_(1)
         return f.logits
@@ -742,8 +744,43 @@ class Engine:
         if use:
             st.graph = graph
             st.step = self._decode_step_fused
+            self._try_stream(st, prompt_len, reps, graph)
         else:
             st.fused = None
+
+    def _try_stream(self, st, prompt_len, reps, base_graph):
+        """Race the L2 cache policy over the whole step.
+
+        Weights and the KV cache are read once per step; the activations are
+        re-read once per column tile, 6.25 GB of L2 hits that v12 showed are
+        real bytes but not a stall. What that experiment could not separate is
+        whether the 8.05 GB weight stream evicts them: so mark the streams
+        evict_first and the activations evict_last, and measure.
+
+        This cannot be a per-role race. A projection timed on its own has no
+        competing traffic to protect, which is exactly how v12 and v5 went
+        wrong, so the comparison has to be the whole step."""
+        plan = st.fused
+        try:
+            plan.stream = True
+            st.attn.stream = True
+            graph = self._capture(st, self._decode_step_fused)
+            t_on = min(self._time_graph(st, graph, prompt_len, reps) for _ in range(2))
+            t_off = min(self._time_graph(st, base_graph, prompt_len, reps) for _ in range(2))
+        except Exception as exc:
+            torch.cuda.synchronize()
+            plan.stream = False
+            st.attn.stream = False
+            _log(f"cache policy unavailable: {type(exc).__name__}: {str(exc)[:200]}")
+            return
+        use = t_on < t_off * MARGIN
+        _log(f"L2 policy: default {t_off:.3f} ms, streaming {t_on:.3f} ms -> "
+             f"{'streaming' if use else 'default'}")
+        if use:
+            st.graph = graph
+        else:
+            plan.stream = False
+            st.attn.stream = False
 
     def _decode_step_mega(self, st):
         """One token per sequence, one launch per layer (v15).

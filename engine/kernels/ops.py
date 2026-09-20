@@ -278,6 +278,7 @@ def _decode_attn_split_kernel(
     stride_cb, stride_ch, stride_cs, chunk, num_splits, sm_scale_log2,
     NQ: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, ONE_SPLIT: tl.constexpr,
+    STREAM: tl.constexpr,
 ):
     b = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -302,14 +303,24 @@ def _decode_attn_split_kernel(
         offs_n = n0 + tl.arange(0, BLOCK_N)
         n_mask = offs_n < end
         kv_off = base + offs_n[:, None].to(tl.int64) * stride_cs + offs_d[None, :]
-        k = tl.load(k_ptr + kv_off, mask=n_mask[:, None], other=0.0)
+        # The cache is read once per step and never reused, so with STREAM it
+        # does not hold L2 at the expense of activations that are re-read.
+        if STREAM:
+            k = tl.load(k_ptr + kv_off, mask=n_mask[:, None], other=0.0,
+                        eviction_policy="evict_first")
+        else:
+            k = tl.load(k_ptr + kv_off, mask=n_mask[:, None], other=0.0)
         s = tl.dot(q, tl.trans(k)) * sm_scale_log2
         s = tl.where(n_mask[None, :], s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         alpha = tl.math.exp2(m_i - m_new)
         p = tl.math.exp2(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        v = tl.load(v_ptr + kv_off, mask=n_mask[:, None], other=0.0)
+        if STREAM:
+            v = tl.load(v_ptr + kv_off, mask=n_mask[:, None], other=0.0,
+                        eviction_policy="evict_first")
+        else:
+            v = tl.load(v_ptr + kv_off, mask=n_mask[:, None], other=0.0)
         # As in FlashAttention, probabilities enter the PV product in the
         # value dtype with FP32 accumulation.
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
@@ -376,11 +387,12 @@ class DecodeAttention:
     BLOCK_N = 64
 
     def __init__(self, batch, capacity, nq, nkv, head_dim, device, target_programs=264,
-                 block_n=None, num_warps=4, num_stages=3):
+                 block_n=None, num_warps=4, num_stages=3, stream=False):
         self.nq, self.nkv, self.d = nq, nkv, head_dim
         self.group = nq // nkv
         self.block_n = block_n or self.BLOCK_N
         self.num_warps, self.num_stages = num_warps, num_stages
+        self.stream = stream  # L2 policy for the KV loads, raced whole-step
         max_splits = triton.cdiv(capacity, self.block_n)
         want = max(1, triton.cdiv(target_programs, batch * nkv))
         splits = min(want, max_splits)
@@ -401,7 +413,8 @@ class DecodeAttention:
             self.chunk, self.splits, self.sm_scale_log2,
             NQ=self.nq, GROUP=self.group, D=self.d,
             BLOCK_H=max(16, triton.next_power_of_2(self.group)), BLOCK_N=self.block_n,
-            ONE_SPLIT=one, num_warps=self.num_warps, num_stages=self.num_stages,
+            ONE_SPLIT=one, STREAM=self.stream,
+            num_warps=self.num_warps, num_stages=self.num_stages,
         )
         if not one:
             _decode_attn_reduce_kernel[(self.batch, self.nq)](

@@ -37,9 +37,15 @@ def _gemv_kernel(
     res_ptr, ssq_out_ptr,
     NORM_IN: tl.constexpr, GLU: tl.constexpr, RES_OUT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr,
+    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr, STREAM: tl.constexpr,
 ):
     # Tensor-core tile version: x is padded to BLOCK_M >= 16 rows for tl.dot.
+    #
+    # STREAM sets the L2 policy. A weight tile is read once per step and never
+    # again, while x is re-read once per column tile -- 6.25 GB of L2 hits per
+    # step, which v12 showed are real bytes that do not stall. The risk is the
+    # 8.05 GB weight stream evicting them anyway, so: weights evict_first,
+    # activations evict_last.
     pid = tl.program_id(0)
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < M
@@ -61,15 +67,25 @@ def _gemv_kernel(
         wu_ptrs = w_ptrs + N.to(tl.int64) * K  # up rows follow the gate rows
         acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k0 in range(0, K, BLOCK_K):
-        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        if STREAM:
+            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0,
+                        eviction_policy="evict_last")
+        else:
+            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
         if NORM_IN:
             nw = tl.load(nw_ptr + k0 + offs_k).to(tl.float32)
             xn = (x.to(tl.float32) * rstd[:, None]).to(dt)
             x = (nw[None, :] * xn.to(tl.float32)).to(dt)
-        w = tl.load(w_ptrs)
+        if STREAM:
+            w = tl.load(w_ptrs, eviction_policy="evict_first")
+        else:
+            w = tl.load(w_ptrs)
         acc += tl.dot(x, w)
         if GLU:
-            wu = tl.load(wu_ptrs)
+            if STREAM:
+                wu = tl.load(wu_ptrs, eviction_policy="evict_first")
+            else:
+                wu = tl.load(wu_ptrs)
             acc_u += tl.dot(x, wu)
             wu_ptrs += BLOCK_K
         x_ptrs += BLOCK_K
@@ -99,7 +115,7 @@ def _gemv_vec_kernel(
     res_ptr, ssq_out_ptr,
     NORM_IN: tl.constexpr, GLU: tl.constexpr, RES_OUT: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr,
+    PARTS: tl.constexpr, SS_STRIDE: tl.constexpr, STREAM: tl.constexpr,
 ):
     # Single-row version (batch 1): plain FMA into a [BLOCK_N, BLOCK_K] FP32
     # accumulator, reduced once at the end. No padding to 16 rows, no
@@ -126,10 +142,16 @@ def _gemv_vec_kernel(
             xn = (x.to(tl.float32) * rstd).to(dt)
             x = (nw * xn.to(tl.float32)).to(dt)
         xf = x.to(tl.float32)
-        w = tl.load(w_ptrs)
+        if STREAM:
+            w = tl.load(w_ptrs, eviction_policy="evict_first")
+        else:
+            w = tl.load(w_ptrs)
         acc += w.to(tl.float32) * xf[None, :]
         if GLU:
-            wu = tl.load(wu_ptrs)
+            if STREAM:
+                wu = tl.load(wu_ptrs, eviction_policy="evict_first")
+            else:
+                wu = tl.load(wu_ptrs)
             acc_u += wu.to(tl.float32) * xf[None, :]
             wu_ptrs += BLOCK_K
         w_ptrs += BLOCK_K
@@ -157,6 +179,7 @@ MAX_SPLIT = 8  # rows of the FP32 partial buffer a split-K projection needs
 def _gemv_splitk_kernel(
     x_ptr, w_ptr, part_ptr, M, N, K,
     SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    STREAM: tl.constexpr,
 ):
     # One program per (column tile, K slice). N = 2560 tiles into only 160
     # programs at BLOCK_N = 16, so a plain grid leaves the second wave a
@@ -174,8 +197,13 @@ def _gemv_splitk_kernel(
     w_ptrs = w_ptr + offs_n[None, :].to(tl.int64) * K + k_start + offs_k[:, None]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for _ in range(0, k_span, BLOCK_K):
-        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
-        w = tl.load(w_ptrs)
+        if STREAM:
+            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0,
+                        eviction_policy="evict_last")
+            w = tl.load(w_ptrs, eviction_policy="evict_first")
+        else:
+            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+            w = tl.load(w_ptrs)
         acc += tl.dot(x, w)
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K
@@ -268,7 +296,8 @@ def candidates(m, split_ok=False):
 
 
 def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
-         norm_w=None, n_parts=1, res=None, glu=False, parts_block=SSQ_PARTS, part=None):
+         norm_w=None, n_parts=1, res=None, glu=False, parts_block=SSQ_PARTS, part=None,
+         stream=False):
     """``x[:m] @ w.T`` into ``out`` (or into ``res`` in place when ``res`` is
     given), with the fusions described above. ``ssq_in``/``ssq_out`` are
     ``[SSQ_PARTS, block_m]`` FP32 buffers and are always passed, even when
@@ -283,7 +312,7 @@ def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
         _gemv_splitk_kernel[(n // cfg.bn, cfg.split)](
             x, w, part, m, n, k,
             SPLIT=cfg.split, BLOCK_M=block_m, BLOCK_N=cfg.bn, BLOCK_K=cfg.bk,
-            num_warps=cfg.warps, num_stages=cfg.stages,
+            STREAM=stream, num_warps=cfg.warps, num_stages=cfg.stages,
         )
         _gemv_splitk_reduce_kernel[(n // cfg.bn,)](
             part, res, ssq_out, m, n,
@@ -297,14 +326,14 @@ def gemv(x, w, out, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
             x, w, dst, n, k, nw, ssq_in, n_parts, eps, dst, ssq_out,
             NORM_IN=norm_in, GLU=glu, RES_OUT=res_out,
             BLOCK_N=cfg.bn, BLOCK_K=cfg.bk, PARTS=parts_block, SS_STRIDE=block_m,
-            num_warps=cfg.warps, num_stages=cfg.stages,
+            STREAM=stream, num_warps=cfg.warps, num_stages=cfg.stages,
         )
         return
     _gemv_kernel[(n // cfg.bn,)](
         x, w, dst, m, n, k, nw, ssq_in, n_parts, eps, dst, ssq_out,
         NORM_IN=norm_in, GLU=glu, RES_OUT=res_out,
         BLOCK_M=block_m, BLOCK_N=cfg.bn, BLOCK_K=cfg.bk,
-        PARTS=parts_block, SS_STRIDE=block_m,
+        PARTS=parts_block, SS_STRIDE=block_m, STREAM=stream,
         num_warps=cfg.warps, num_stages=cfg.stages,
     )
 
