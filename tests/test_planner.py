@@ -184,17 +184,26 @@ def test_wide_tiles_cut_the_activation_re_read():
           f"a 128-wide tile re-reads {wide_l2}, against {narrow_l2}")
 
 
-def test_split_does_not_add_activation_traffic():
+def test_split_costs_partials_and_nothing_else():
     """Splitting K restores the program count without paying for it twice --
-    which is the reason a wide tile is affordable at all."""
+    which is the reason a wide tile is affordable at all.
+
+    The partials it does cost are charged as a stream, not as an L2 hit:
+    megabytes, written and read either side of a weight stream that is a
+    hundred times larger and evicts them.
+    """
     dev = planner.Device()
     n, k = 2560, 4096
-    base = planner.traffic(planner.Tile(16, 128, 64, 1), 16, n, k, False, dev)[1]
+    unsplit = planner.Tile(16, 128, 64, 1)
+    base_l2, base_eff = planner.traffic(unsplit, 16, n, k, False, dev)[1:]
     for split in (2, 4, 8):
-        got = planner.traffic(planner.Tile(16, 128, 64, split), 16, n, k, False, dev)[1]
+        l2, eff = planner.traffic(planner.Tile(16, 128, 64, split), 16, n, k,
+                                  False, dev)[1:]
         partials = 2 * split * 16 * n * 4
-        check(abs(got - base - partials) < 1,
-              f"split {split} changed the x term, not only the partials")
+        check(abs(l2 - base_l2) < 1,
+              f"split {split} moved the activation term by {l2 - base_l2}")
+        check(abs(eff - base_eff - partials) < 1,
+              f"split {split} cost {eff - base_eff} rather than {partials}")
 
 
 def test_calibration_recovers_planted_constants():

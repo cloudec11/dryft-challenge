@@ -124,7 +124,8 @@ def run_proj(tile, m, n, k, *, norm, glu, res, parts=3, seed=0):
             i32(parts), eps)
     kwargs = dict(NORM=norm, GLU=glu, RES=res, SPLIT=tile.split,
                   FIXUP=tile.fixup, BLOCK_M=tile.bm, BLOCK_N=tile.bn,
-                  BLOCK_K=tile.bk, SS_STRIDE=ss_stride)
+                  BLOCK_K=tile.bk, SS_STRIDE=ss_stride,
+                  PART_STEPS=-(-parts // 16) if norm else 1)
     tlsim.run(kgemm, "_proj_kernel", (n // tile.bn, tiles_m, tile.split),
               args, kwargs, jit_names=("_epilogue", "_rstd_from_parts"))
     if tile.split > 1 and not tile.fixup:
@@ -223,7 +224,8 @@ def test_vector_kernel():
                        ptr(sob, "ssq_out", tlsim.float32), ptr(flat(nw), "norm_w"),
                        i32(n), i32(k), i32(parts), eps),
                       dict(NORM=norm, GLU=glu, RES=res, BLOCK_N=bn, BLOCK_K=bk,
-                           SS_STRIDE=ss_stride))
+                           SS_STRIDE=ss_stride,
+                           PART_STEPS=-(-parts // 16) if norm else 1))
             got = rb if res else yb
             want = (r_ref if res else y_ref).float().numpy().ravel()
             close(got, want, f"vec {tile} norm={norm} glu={glu} res={res}")
@@ -258,7 +260,8 @@ def test_rms_norm_cast_boundary():
                    tlsim.float32),
                ptr(flat(nw), "norm_w"), i32(1), i32(k), i32(k), i32(0), i32(1), eps),
               dict(NORM=True, GLU=False, RES=False, SPLIT=1, FIXUP=False,
-                   BLOCK_M=16, BLOCK_N=tile.bn, BLOCK_K=tile.bk, SS_STRIDE=16),
+                   BLOCK_M=16, BLOCK_N=tile.bn, BLOCK_K=tile.bk, PART_STEPS=1,
+                   SS_STRIDE=16),
               jit_names=("_epilogue", "_rstd_from_parts"))
     reference = kref.rms_norm(x, nw, eps).float().numpy().ravel()
     rstd = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)

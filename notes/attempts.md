@@ -17,7 +17,8 @@ workloads. Fill in the numbers from the run page.
 | 10 | _tbd_ | v10: widened exact speculative verification (n-gram drafts) | 900.9 | yes | Statistically flat versus v8's 902.9; inspect spec logs before changing it again. |
 | 11 | _tbd_ | v11: 3-gram → 2-gram backoff proposer, exact verification | | | Isolates proposal quality while restoring the known-good K=3 verifier. |
 | 12 | cc4ca3d | v12: tile scoring on modelled traffic, split-K gated on the candidate's own grid | 898.5 (v11 run) | yes | Diagnosis recorded in `notes/v12-design.md`; never measured on its own. |
-| 13 | _tbd_ | v13: new engine. Calibrated traffic model, split-K reduced inside the launch, offline test suite | | | Design: `notes/v13-design.md`. |
+| 13 | 211a1ea | v13: new engine. Calibrated traffic model, split-K reduced inside the launch, offline test suite | 864.5 | yes | **-4.3% vs v8.** Scored, all gates passed. 864.5 is v1's 855.3 within noise: the fused step never ran. |
+| 14 | _tbd_ | v14: fix the acceptance test that was rejecting the fused step, and race whole plans | | | The fallback from a rejected plan is now the incumbent plan, not cuBLAS. |
 
 ## v1 design (branch `fast-engine`)
 
@@ -574,3 +575,83 @@ largest item: 778 MB of activation re-reads at `BLOCK_N=16` against 97 MB at
 128, and no split-K needed to keep the device full. If the traffic model is
 right, the three public shapes improve together; if only batch 1 moves, it is
 the launch term and not the traffic term.
+
+
+## v13 result: 864.5, and what the number says
+
+Run on `211a1ea`. Ranked, correct, inside every gate -- latency, memory,
+spread. And 4.3% below v8's 902.9, which is outside the 1-2% this platform
+moves on identical code, so it is a regression and not noise.
+
+The useful part is *which* number it is. 864.5 against v1's 855.3 is +1.1%,
+and v1 is the engine this one keeps as its floor: packed weights, cuBLAS
+projections, a Triton attention, CUDA-graphed. That is `_step_safe`. Every
+tile the traffic model chose, every split-K reduction folded into its own
+launch, the whole point of the rewrite -- none of it was running. The engine
+scored what its fallback is worth.
+
+### Why the fused step never ran
+
+`_check_fast` decides whether the fused step is allowed to run, by comparing
+its logits with the cuBLAS step's. It did that over a KV cache filled with
+`normal_(0, 0.1)`, and required `max|dlogit| <= 1.0` plus exact argmax
+agreement on the first step.
+
+Both halves of that are wrong, and they compound:
+
+* **The state is out of distribution.** Attention over noise contributes
+  almost nothing, so the residual stream is the MLP path alone, 36 layers
+  deep, on a state the model never sees. Its logits are larger than a real
+  prompt's, and two implementations differing only in BF16 rounding drift
+  further apart in *absolute* terms -- which is what a fixed 1.0-logit
+  threshold measures. v12's equivalent check prefilled a synthetic prompt of
+  the real shape and allowed 1.5; this one was stricter and worse conditioned
+  at the same time.
+* **Exact argmax agreement is not the rule.** The contract's rule is 2.0
+  logits, and native Qwen drifts 0.75 against itself. A genuine near-tie flip
+  is explicitly allowed and explicitly does not cascade. Rejecting on one cost
+  the workload its entire decode path.
+
+And the failure was silent in the way that matters: **a rejected plan fell all
+the way back to cuBLAS**, rather than to the next best plan. There is no
+gradient in that -- one bad comparison and 4% is gone, with no signal on the
+run page except a score that looks like an earlier engine's.
+
+### v14
+
+1. **Check on a real state.** `_check_fast` prefills random token ids -- what
+   the judge actually sends -- and compares over that. A hundred milliseconds
+   of a budget with minutes in it.
+2. **Judge the token, not the vector.** The test is now what the judge asks:
+   the token the fused step would emit, scored against the reference step's
+   own best, and it must sit within 0.5 logits of it. Four times stricter
+   than the rule it protects, and it does not reject a near-tie.
+3. **Fall back to the next plan, not to the floor.** If a plan fails its
+   check, the engine tries the incumbent plan -- the tile v1 through v12 all
+   ran -- before it gives up on the fused step at all.
+4. **Race whole plans, not whole roles.** A per-role race times one
+   projection over 36 layers with nothing else running, which is not what
+   that projection meets inside a step: between two of its launches the step
+   streams a layer's weights and its whole KV cache past the same L2. So the
+   tuned plan now has to beat the incumbent plan *end to end, on the real
+   shape*, by 1%, or it does not ship. The model and the role races propose;
+   this disposes. It is also the only part of the design that is immune to
+   the model being wrong.
+5. **Unroll the sum-of-squares hand-off.** v13 made its trip count a runtime
+   value to save specialisations. It runs in the prologue of every program of
+   three of the five roles, ahead of the weight stream it is holding up, and
+   the producer's partial count takes one of three values in a whole run.
+   Constexpr, unrolled.
+6. **Charge split-K partials at the HBM price.** They are megabytes, and
+   between the write and the read the same kernel streams up to a hundred
+   megabytes of weights past the same cache. x survives that; they do not.
+   The model was pricing them at 0.6, which biased it toward deep splits.
+
+### The lesson worth keeping
+
+An acceptance test that can reject has to fail to the next best thing, not to
+the floor -- and its own conditioning is part of the measurement. This one was
+measuring the distance between two implementations on a state neither would
+ever see, and the run page cannot tell you that: official runs show no engine
+output, so a silent fallback and a real regression look identical from here.
+The only defence is that every fallback be a small step down.
