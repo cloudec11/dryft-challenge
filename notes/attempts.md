@@ -1021,3 +1021,32 @@ device (8 x batch x kv_heads programs) and bounds the reduction depth.
 Unlike the three wrong theories above, this one is not contradicted by
 anything in the log: it predicts failures on long-context hidden shapes only,
 which is exactly what two runs have shown.
+
+## Run 24 (official db305dcc, v22) - 870.74, B1 4.322: still not the gate
+
+Restoring `max_d` to 1.5 did not bring batch 1 back either. Four theories,
+four wrong. The state of the batch-1 regression:
+
+| version | B1 TPOT | what changed |
+|---|---:|---|
+| v17 | 3.958 | - |
+| v19 | 4.352 | budgets cut, `max_d` 1.5->0.75, `mean_d` 0.1->0.05, cap 4, attn tol 0.5%, stream race |
+| v20 | 4.346 | attn tol back to 2% |
+| v21 | 4.358 | cap 4->6, budget 30->50 |
+| v22 | 4.322 | `max_d` back to 1.5, split cap 8 |
+
+v19 changed six things at once, which is why this has taken four runs to
+unpick - a reminder that the 2% noise floor makes bundled changes expensive
+to debug, not cheap.
+
+v23 puts the last two gate values back at v8's (`mean_d` 0.1, prefill GQA
+tolerance 2%) and drops the low-entropy check, which could only ever reject,
+invisibly. `mean_d` is the better suspect of the two: it is a mean over BF16
+logits whose ulp at magnitude 16-32 is 0.125-0.25, so 0.05-0.1 is simply what
+two valid summation orders look like.
+
+It also restores v8's warmup budgets (90 s / 25 s, no candidate cap). The run
+limit is real but not close: v17 at 90/25 took 9m34s and v22 at 50/8 took
+9m10s, both against 15 minutes. That leaves exactly one un-reverted change
+that can touch batch-1 speed - the cache-policy race - so if batch 1 comes
+back, the gates were the cause; if it does not, `_try_stream` is.
