@@ -20,11 +20,26 @@ Both are answered here:
               this program's partial sum of squares for the next RMSNorm.
 
 * Tiles are chosen by measurement, from a space built around the device's SM
-  count rather than a fixed list. What limits a streaming kernel here is
-  wave quantisation -- ``N/BLOCK_N`` programs spread over 132 SMs, where a
-  1.2-wave grid wastes 40% of the second wave -- and how many bytes each SM
-  keeps in flight. :func:`candidates` enumerates the space, scores every
-  point on both, and hands the tuner an ordered shortlist.
+  count rather than a fixed list. Two things limit a streaming kernel here,
+  and the second one is much larger than it looks:
+
+  - **Wave quantisation.** ``N/BLOCK_N`` programs over 132 SMs, where a
+    1.2-wave grid wastes 40% of the second wave. v11 was built around this
+    and measured no change, so it is real but it is not the binding cost.
+  - **Activation re-reads.** Each of the ``N/BLOCK_N`` programs streams the
+    whole ``[BLOCK_M, K]`` input tile, so at ``BLOCK_M = BLOCK_N = 16`` the
+    x tile and the weight tile are *exactly the same size* and half of every
+    load is a re-read of the same 80 KB. Per step that is 6.25 GB against
+    8.05 GB of weights: the step issues 14.3 GB of loads to deliver 8.05 GB,
+    which is why it looks like 60% of HBM while the memory system is close
+    to saturated.
+
+  Widening ``BLOCK_N`` divides the second term and shrinks the grid, so the
+  two have to be traded against each other -- and split-K is what makes the
+  trade affordable, because it restores the program count without adding
+  back any x traffic. :func:`candidates` enumerates the space, scores every
+  point on modelled traffic per unit of wave efficiency, and hands the tuner
+  an ordered shortlist that the measurement then decides between.
 
 Numerics: BF16 rounding happens exactly where Transformers 4.51.3 rounds
 (``ref.py`` holds the twins these are checked against). Sums are reordered,
@@ -53,6 +68,13 @@ MAX_SPLIT = 16
 # we stop bothering to compile it.
 SMEM_PER_SM = 227 * 1024
 SMEM_MAX_BLOCK = 200 * 1024
+# A re-read of x is served by L2 (x is 80 KB at batch 16), so it is cheaper
+# per byte than a weight coming from HBM -- but it competes for the same
+# issue slots and L2 ports, so it is not free either.
+L2_COST = 0.6
+# A launch costs ~2.8 us here, which at the ~2.0 TB/s the step actually
+# streams is worth about this many bytes of traffic.
+LAUNCH_BYTES = 5.6e6
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +279,8 @@ def _proj_vec_kernel(
 
 
 class Config:
-    __slots__ = ("bn", "bk", "split", "stages", "warps", "vec", "ctas", "waves", "flight")
+    __slots__ = ("bn", "bk", "split", "stages", "warps", "vec", "ctas", "waves",
+                 "flight", "traffic", "cost")
 
     def __init__(self, bn, bk, split=1, stages=3, warps=4, vec=False):
         self.bn, self.bk, self.split = bn, bk, split
@@ -265,6 +288,8 @@ class Config:
         self.ctas = 0
         self.waves = 1.0
         self.flight = 0
+        self.traffic = 0.0
+        self.cost = 0.0
 
     def __repr__(self):
         kind = "vec" if self.vec else ("k%d-" % self.split if self.split > 1 else "")
@@ -289,34 +314,61 @@ def _blocks_per_sm(cfg, block_m, glu):
     return min(by_smem, by_threads, 32)
 
 
-def _score(cfg, block_m, glu, n, k, sm_count, prefer_wide=False):
-    """Rank a candidate on the two things that decide a weight stream.
+def _score(cfg, m, block_m, glu, n, k, sm_count, prefer_wide=False):
+    """Rank a candidate on the bytes it makes the memory system move.
 
-    ``waves``  programs divided by SMs. A grid of 160 programs on 132 SMs
-               runs as two rounds for 1.21 rounds of work, so 40% of the
-               second round is idle -- which is most of the gap between the
-               measured 2.0 TB/s and the 3.35 TB/s the device can do.
-    ``flight`` bytes of weight an SM keeps outstanding. Too few and the
-               kernel is latency-bound however well it is balanced.
+    The term that dominates, and that v11 did not model at all: every one of
+    the ``N / BLOCK_N`` programs streams the *whole* ``[BLOCK_M, K]`` input
+    tile. At ``BLOCK_M = BLOCK_N = 16`` the x tile and the weight tile are
+    the same size, so half of every load is a re-read of the same 80 KB of
+    activations -- 6.25 GB per step against 8.05 GB of weights. x is small
+    enough to sit in L2, so it never shows up as HBM traffic; it shows up as
+    a step that streams 14.3 GB to deliver 8.05 GB.
+
+    Widening ``BLOCK_N`` divides that term, but it also shrinks the grid, so
+    the two have to be scored together -- which is what split-K is for here:
+    it restores the program count without touching the x term, because each
+    program then reads only ``K / SPLIT`` of the row.
     """
     cfg.ctas = (n // cfg.bn) * cfg.split
     rounds = cfg.ctas / sm_count
     cfg.waves = rounds / math.ceil(rounds) if rounds > 0 else 0.0
     per_stage_weight = (2 if glu else 1) * cfg.bk * cfg.bn * 2
     cfg.flight = _blocks_per_sm(cfg, block_m, glu) * cfg.stages * per_stage_weight
-    # Efficiency first, in coarse buckets so a 1% modelling difference cannot
-    # outrank a real bandwidth difference; then bytes in flight. A wide tile
-    # is preferred for the roles that produce sums of squares, because its
-    # program count is what every consumer's prologue then has to read.
-    return (-round(cfg.waves, 2), -min(cfg.flight, 128 * 1024),
-            -cfg.bn if prefer_wide else cfg.bn)
+
+    # Rows that actually cost a load. The tile kernel pads x to BLOCK_M for
+    # tl.dot, but the padded rows are masked off and never issue.
+    rows = 1 if cfg.vec else min(block_m, m)
+    w_bytes = n * k * (2 if glu else 1) * 2
+    # Split does not appear: SPLIT programs each read K/SPLIT of the row.
+    x_bytes = (n // cfg.bn) * rows * k * 2
+    part_bytes = 2 * cfg.split * rows * n * 4 if cfg.split > 1 else 0
+    cfg.traffic = w_bytes + L2_COST * (x_bytes + part_bytes)
+
+    # Idle SMs in the tail wave stretch the whole read, so time goes as
+    # traffic / (bandwidth * wave efficiency).
+    cost = cfg.traffic / max(cfg.waves, 1e-3)
+    if cfg.split > 1:
+        cost += LAUNCH_BYTES  # the reduce kernel is a whole extra launch
+    if cfg.flight < 32 * 1024:
+        cost *= 1.25  # too little outstanding to reach peak however balanced
+    # Splitting K deeply shortens every program's loop. Once there are fewer
+    # iterations than pipeline stages the prefetch never reaches steady state
+    # and the tile is all prologue, whatever its traffic looks like.
+    iters = (k // cfg.split) // cfg.bk
+    if iters < cfg.stages:
+        cost *= 1.5
+    cfg.cost = cost
+    return (round(cost / 1e6, 1), -cfg.bn if prefer_wide else cfg.bn)
 
 
 # Tried first for every role, and the incumbent a measured candidate has to
 # beat by the tuner's margin: the tile v1-v10 ran with.
 _SAFE = (16, 256, 3, 4)
 _BN = (16, 32, 64, 128)
-_BK = (128, 256, 512, 1024)
+# 64 is here for one reason: K = 9728 is 512 * 19, so `bk * split` has to
+# divide 512, and at bk = 128 the down projection cannot split deeper than 4.
+_BK = (64, 128, 256, 512, 1024)
 _STAGES = (3, 4)
 _WARPS = (4, 8)
 
@@ -324,10 +376,12 @@ _WARPS = (4, 8)
 def candidates(m, n, k, glu, sm_count, limit=11, prefer_wide=False):
     """An ordered shortlist of tiles to race for one projection.
 
-    The first entry is the incumbent; everything after it is sorted by
-    predicted wave efficiency and then by bytes in flight. Split-K is offered
-    only where the unsplit grid is too small to fill the device -- the
-    ``N = hidden`` projections, whose 2560 columns tile into 160 programs.
+    The first entry is the incumbent -- the tile v1-v11 actually ran -- so a
+    budget that runs out after one compile still leaves a working engine.
+    Everything after it is sorted by :func:`_score`, i.e. by modelled bytes
+    moved per unit of wave efficiency. Split-K is offered wherever *that
+    tile's* grid cannot fill the device, which is what lets a wide tile trade
+    programs for x re-reads and buy the programs back.
 
     ``prefer_wide`` breaks ties towards a wider tile, for the roles whose
     program count becomes every consumer's prologue cost.
@@ -338,10 +392,18 @@ def candidates(m, n, k, glu, sm_count, limit=11, prefer_wide=False):
         pool += [Config(bn, bk, vec=True, stages=st, warps=wp)
                  for bn in (4, 8, 16) for bk in (256, 512)
                  for st in (2, 3) for wp in (4, 8)]
-    splits = (1,)
-    if n // 16 < 2 * sm_count:
-        splits = tuple(s for s in (1, 2, 4, 8) if s <= MAX_SPLIT)
     for bn in _BN:
+        if n % bn or bn > n:
+            continue
+        # Split-K is judged against *this* tile's grid, not against the
+        # 16-wide one. That is the whole point: a wide tile cuts the x
+        # re-reads and empties the device, and split-K fills it back up.
+        tiles = n // bn
+        if tiles < 2 * sm_count:
+            splits = tuple(s for s in (1, 2, 4, 8, 16)
+                           if s <= MAX_SPLIT and tiles * s <= 8 * sm_count)
+        else:
+            splits = (1,)
         for bk in _BK:
             for sp in splits:
                 for st in _STAGES:
@@ -361,18 +423,22 @@ def candidates(m, n, k, glu, sm_count, limit=11, prefer_wide=False):
         if key in seen:
             continue
         seen.add(key)
-        _score(cfg, block_m, glu, n, k, sm_count, prefer_wide)
+        _score(cfg, m, block_m, glu, n, k, sm_count, prefer_wide)
         out.append(cfg)
-    out.sort(key=lambda c: _score(c, block_m, glu, n, k, sm_count, prefer_wide))
+    out.sort(key=lambda c: _score(c, m, block_m, glu, n, k, sm_count, prefer_wide))
 
     head = []
     bn, bk, st, wp = _SAFE
     safe = Config(bn, bk, stages=st, warps=wp)
     # The incumbent still has to be launchable: its x tile is BLOCK_M wide,
     # so at a large batch it runs out of shared memory like any other.
-    if (m > 1 and n % bn == 0 and k % bk == 0
+    if (n % bn == 0 and k % bk == 0
             and smem_bytes(safe, block_m, glu) <= SMEM_MAX_BLOCK):
-        _score(safe, block_m, glu, n, k, sm_count, prefer_wide)
+        # Offered at batch 1 too. v11 handed batch 1 to the vector kernel with
+        # nothing to beat, and batch-1 TPOT went 3.883 -> 3.990 ms; the tile
+        # kernel handles a single row perfectly well by masking, so it stays
+        # the thing that has to be beaten.
+        _score(safe, m, block_m, glu, n, k, sm_count, prefer_wide)
         head.append(safe)
     for cfg in out:
         if len(head) >= limit:
@@ -414,6 +480,11 @@ def project(x, w, y, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
         parts_block, n_parts = NO_PARTS, 1
     elif n_parts > parts_block:
         raise ValueError(f"{n_parts} partials do not fit in {parts_block}")
+
+    if cfg.split > 1 and (part is None or part.shape[-1] < n):
+        # Only the roles the plan sized the buffer for may split; a role that
+        # slipped through is skipped by the tuner rather than corrupting it.
+        raise ValueError(f"no split-K partial buffer for n={n}")
 
     if cfg.vec:
         # The single-row kernel has no row dimension at all, so a batch that
