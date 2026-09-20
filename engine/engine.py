@@ -7,8 +7,10 @@ A decode step reads every weight exactly once -- 8.05 GB, of which 0.78 GB is
 the tied LM head -- plus the KV cache. On an H100 SXM that is a ~2.4 ms floor
 at batch 16 over 640 slots, and no rearrangement of the arithmetic changes
 it. Measured against that floor this family of engines has run at about
-2.0 TB/s effective, or 60% of the device, so the engine is built around the
-three things that account for the other 40%:
+2.0 TB/s of *weights*, which reads as 60% of the device -- but the step also
+issues 6.25 GB of activation re-reads that never reach HBM, so it is moving
+14.3 GB of loads in 4.8 ms and the memory system is closer to saturated than
+idle. The engine is built around the three costs that follow from that:
 
 1. **Launch count.** ~185 short kernels per step, each paying wave fill and
    drain. A launch measured here costs ~2.8 us, so the step's launches are
@@ -17,13 +19,17 @@ three things that account for the other 40%:
    and the cache write ride inside attention; and attention skips its reduce
    kernel whenever one split covers the sequence. A layer is five launches.
 
-2. **Wave quantisation.** ``N/BLOCK_N`` programs over 132 SMs. The O and down
-   projections have N = 2560, which tiles into 160 programs: two rounds of
-   work for 1.21 rounds of occupancy, so 40% of the second round is idle.
-   ``kernels/proj.candidates`` enumerates tiles around the device's real SM
-   count, scores each on wave efficiency and on bytes in flight per SM, and
-   hands the tuner an ordered shortlist. Split-K is offered exactly where the
-   unsplit grid is too small to fill the device.
+2. **Activation re-reads.** Each of a projection's ``N/BLOCK_N`` programs
+   streams the whole ``[BLOCK_M, K]`` input tile. At ``BLOCK_M = BLOCK_N =
+   16`` -- the tile v1 through v11 all ran -- the x tile and the weight tile
+   are exactly the same size, so half of every load is a re-read of the same
+   80 KB of activations: 6.25 GB per step against 8.05 GB of weights. The
+   step issues 14.3 GB of loads to deliver 8.05 GB, which is the whole
+   reason it reads as 60% of HBM. ``kernels/proj.candidates`` scores tiles on
+   that traffic, on wave quantisation (``N/BLOCK_N`` over 132 SMs, where a
+   1.2-wave grid wastes 40% of the second wave) and on bytes in flight, and
+   split-K is offered wherever a tile's own grid leaves the device
+   underfilled -- which is what lets a wide tile pay for itself.
 
 3. **Everything raced, nothing assumed.** Run-to-run timing noise on this
    platform is 1-2%, so a single measurement is weak evidence. Each race
@@ -96,11 +102,21 @@ FUSED_MAX_BATCH = 128
 # measurements is how a tuner talks itself into a worse configuration; the
 # candidate lists are ordered so that earlier means safer.
 MARGIN = 0.97
+# The per-role tile race is a different kind of comparison and needs a
+# different threshold. MARGIN guards decisions made *between* platform runs,
+# where 1-2% is noise. A tile race is an in-process A/B on the same device in
+# the same second, over 36 layers of real weights, minimum-of-rounds: its
+# noise is well under 1%. Applying the between-run figure here rejects a 2%
+# win on every one of five roles and keeps the incumbent everywhere -- which
+# is exactly what v11 did, and why its B16 TPOT came back at 4.803 ms against
+# v8's 4.808 despite searching a far wider space.
+TILE_MARGIN = 0.995
 # Warmup seconds for the projection tiles and for the attention tile, and how
-# many candidates one projection may compile.
-TUNE_BUDGET_S = 60.0
+# many candidates one projection may compile. The projection budget is spent
+# once per distinct batch, not once per shape (see ``_tile_cache``).
+TUNE_BUDGET_S = 80.0
 ATTN_TUNE_BUDGET_S = 15.0
-CAND_LIMIT = 9
+CAND_LIMIT = 10
 
 
 def _log(message):
@@ -139,7 +155,12 @@ class FusedPlan:
         self.attn_out = torch.empty((batch, self.k_o), dtype=dt, device=dev)
         self.act = torch.empty((batch, self.inter), dtype=dt, device=dev)
         self.logits = torch.empty((batch, self.vocab), dtype=dt, device=dev)
-        self.part = kproj.part_buffer(self.bm, self.hidden, dev)
+        # Split-K is now offered to any role whose tile leaves the device
+        # underfilled, so the partial buffer has to cover the widest of them.
+        # The LM head never splits (1187 programs at its widest tile), and
+        # gate/up cannot (two accumulators, one buffer), so this is the QKV
+        # projection's 6144 columns.
+        self.part = kproj.part_buffer(self.bm, max(self.hidden, self.n_qkv), dev)
         self.ssq_a = torch.zeros((kproj.SSQ_PARTS, self.bm), dtype=torch.float32, device=dev)
         self.ssq_b = torch.zeros_like(self.ssq_a)
 
@@ -234,6 +255,12 @@ class Engine:
         )
         self.state = None
         self._seed = 1234
+        # Tile choices depend on (batch, role) alone, never on prompt length
+        # or output length, so a second shape at a batch already tuned reuses
+        # the result instead of spending the budget again. With six hidden
+        # workloads that is the difference between tuning once per batch and
+        # once per workload.
+        self._tile_cache = {}
         # Bytes of weight a decode step streams, for the throughput report.
         self.weight_bytes = sum(
             t.numel() * t.element_size()
@@ -515,7 +542,7 @@ class Engine:
     # ---------------------------------------------------------------- tuning
 
     @staticmethod
-    def _time_replays(graph, rounds=2, reps=2):
+    def _time_replays(graph, rounds=4, reps=2):
         """Minimum over rounds of the mean replay time, in ms. The minimum
         rejects a round that lost the GPU to something else."""
         best = float("inf")
@@ -530,12 +557,12 @@ class Engine:
             best = min(best, e0.elapsed_time(e1) / reps)
         return best
 
-    def _race(self, timings, label):
+    def _race(self, timings, label, margin=MARGIN):
         """Pick from ``[(ms, item), ...]``. The first entry is the incumbent,
-        and a later one has to beat it by ``MARGIN``."""
+        and a later one has to beat it by ``margin``."""
         best = timings[0]
         for entry in timings[1:]:
-            if entry[0] < best[0] * MARGIN:
+            if entry[0] < best[0] * margin:
                 best = entry
         _log(f"  {label}: {best[1]} at {best[0] * 1000:.1f}us | "
              + " ".join(f"{e[1]}={e[0] * 1000:.1f}" for e in timings))
@@ -590,7 +617,7 @@ class Engine:
         if not timings:
             raise RuntimeError(f"no tile ran for {role}")
 
-        ms, best = self._race(timings, f"{role} n={n} k={k}")
+        ms, best = self._race(timings, f"{role} n={n} k={k}", margin=TILE_MARGIN)
         moved = n * k * (2 if glu else 1) * 2  # bytes of weight per call
         _log(f"    {role}: {moved / 1e6 / ms:.0f} GB/s, {best.ctas} programs, "
              f"{best.waves:.2f} wave efficiency, {best.flight // 1024} KiB in flight/SM")
@@ -702,11 +729,19 @@ class Engine:
         st.fused = plan
         # One slice of the budget per role, so early roles cannot starve the
         # last ones; time a role does not use carries forward.
-        slice_s = TUNE_BUDGET_S / len(plan.ROLES)
-        for i, role in enumerate(plan.ROLES):
-            plan.cfg[role] = self._tune_proj(plan, role, start + slice_s * (i + 1))
-            if role == "down":
-                plan.note_producers()
+        cached = self._tile_cache.get(st.batch)
+        if cached is not None:
+            plan.cfg.update(cached)
+            plan.note_producers()
+            _log(f"tiles for batch {st.batch} reused: "
+                 + " ".join(f"{r}={plan.cfg[r]!r}" for r in plan.ROLES))
+        else:
+            slice_s = TUNE_BUDGET_S / len(plan.ROLES)
+            for i, role in enumerate(plan.ROLES):
+                plan.cfg[role] = self._tune_proj(plan, role, start + slice_s * (i + 1))
+                if role == "down":
+                    plan.note_producers()
+            self._tile_cache[st.batch] = dict(plan.cfg)
 
         ok, detail = self._check_fused(st, prompt_len, new_tokens)
         _log(f"fused step vs reference: {detail} -> {'ok' if ok else 'REJECTED'}")

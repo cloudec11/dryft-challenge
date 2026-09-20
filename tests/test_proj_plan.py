@@ -92,14 +92,28 @@ def test_candidates_are_launchable():
 
 
 def test_split_only_where_the_grid_is_too_small():
-    """Split-K costs a reduce launch, so it is offered only for the two
-    projections whose 2560 columns cannot fill the device on their own."""
+    """Split-K costs a reduce launch, so it is offered only where *that
+    tile's* grid cannot fill the device -- which is the whole mechanism by
+    which a wide tile is affordable: it trades programs for x re-reads and
+    buys the programs back."""
     for role, n, k, glu, res in ROLES:
-        splits = {c.split for c in proj.candidates(16, n, k, glu, SM, prefer_wide=res)}
-        if n == HIDDEN:
-            assert splits - {1}, f"{role} should be allowed to split K"
-        else:
-            assert splits == {1}, f"{role} should not split K, got {splits}"
+        for cfg in proj.candidates(16, n, k, glu, SM, prefer_wide=res):
+            if cfg.split > 1:
+                assert n // cfg.bn < 2 * SM, f"{role} {cfg}: grid was already full"
+                assert cfg.ctas <= 8 * SM, f"{role} {cfg}: {cfg.ctas} programs is pointless"
+                assert not glu, f"{role} {cfg}: gate/up has two accumulators"
+
+
+def test_split_fits_the_partial_buffer():
+    """``FusedPlan`` sizes one FP32 scratch buffer from the widest role that
+    is allowed to split. A role that splits wider than that would write past
+    it, so nothing may split beyond QKV's column count."""
+    widest = max(HIDDEN, 6144)
+    for m in BATCHES:
+        for role, n, k, glu, res in ROLES:
+            for cfg in proj.candidates(m, n, k, glu, SM, prefer_wide=res):
+                if cfg.split > 1:
+                    assert n <= widest, f"{role} {cfg}: n={n} exceeds the buffer"
 
 
 def test_partials_fit_the_handoff_buffer():
@@ -124,15 +138,30 @@ def test_incumbent_leads_the_shortlist():
         assert (first.bn, first.bk, first.split) == (16, 256, 1), f"{role}: {first!r}"
 
 
-def test_wave_efficiency_is_the_first_sort_key():
-    """The O projection is the case the scoring exists for: 2560 columns in
-    tiles of 16 is 160 programs on 132 SMs, which runs as two rounds for 1.21
-    rounds of work. Something better has to be offered above it."""
-    cands = proj.candidates(16, HIDDEN, 4096, False, SM, prefer_wide=True)
-    unsplit = next(c for c in cands if c.split == 1 and c.bn == 16)
-    assert unsplit.ctas == 160, unsplit.ctas
-    assert abs(unsplit.waves - 160 / 132 / 2) < 1e-6, unsplit.waves
-    assert cands[1].waves > 0.9, f"nothing balances the O projection: {cands[1]!r}"
+def test_activation_rereads_are_scored():
+    """The term v11 missed. Every one of the ``N / BLOCK_N`` programs streams
+    the whole ``[BLOCK_M, K]`` input tile, so at ``BLOCK_M = BLOCK_N = 16``
+    the x tile and the weight tile are the same size and half of every load
+    is a re-read. The shortlist has to offer something wider than 16."""
+    for role, n, k, glu, res in ROLES:
+        cands = proj.candidates(16, n, k, glu, SM, prefer_wide=res)
+        # gate/up is the one role that cannot improve: its two weight blocks
+        # already share one x tile, and it may not split.
+        if glu:
+            continue
+        assert any(c.bn > 16 for c in cands[1:]), f"{role}: no wide tile offered"
+        assert cands[1].cost < cands[0].cost, (
+            f"{role}: the incumbent {cands[0]!r} was not beaten in the model")
+
+
+def test_wide_tiles_refill_the_grid():
+    """A wide tile is only worth offering if it still fills the device, by
+    its own program count or with split-K."""
+    for role, n, k, glu, res in ROLES:
+        for cfg in proj.candidates(16, n, k, glu, SM, prefer_wide=res)[1:]:
+            if cfg.vec:
+                continue
+            assert cfg.waves >= 0.5, f"{role} {cfg}: {cfg.waves:.2f} wave efficiency"
 
 
 def test_batch_one_gets_the_single_row_kernel():
