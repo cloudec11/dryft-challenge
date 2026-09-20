@@ -72,7 +72,7 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # 300 s load-plus-warmup budget past which it is not worth starting: it is one
 # large kernel, and ptxas on it is the slowest compile in the engine.
 MEGA_ENABLED = True
-MEGA_DEADLINE_S = 170.0
+MEGA_DEADLINE_S = 245.0
 # Diagnostic: adopt the one-launch step whenever it is *correct*, skipping the
 # timing race. v15 came back indistinguishable from v8 on every shape (B16
 # TPOT 4.805 vs 4.808 on the same machine cluster), which means the fused step
@@ -88,8 +88,8 @@ MEGA_FORCE = True
 FUSED_MAX_BATCH = 128
 # Warmup seconds allowed for tuning the fused step's GEMM tiles, and for the
 # decode attention tile shape.
-TUNE_BUDGET_S = 90.0
-ATTN_TUNE_BUDGET_S = 25.0
+TUNE_BUDGET_S = 55.0
+ATTN_TUNE_BUDGET_S = 12.0
 # A later candidate has to win by this much to displace an earlier one. Runs
 # vary by ~1-2% on identical code, so picking the bare minimum of a set of
 # noisy measurements is how a tuner talks itself into a worse configuration;

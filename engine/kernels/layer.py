@@ -47,14 +47,21 @@ FLAG_BLOCK = 256  # >= grid, power of two for tl.arange
 def _arrive_and_wait(flag_ptr, slot, pid, G: tl.constexpr, FLAG_BLOCK: tl.constexpr):
     tl.debug_barrier()  # every warp in this block has finished the stage
     base = flag_ptr + slot * FLAG_BLOCK
-    tl.atomic_xchg(base + pid, 1, sem="release", scope="gpu")
+    # Arrive with an atomic and no sem/scope keywords: those exist in newer
+    # Triton than 3.1 is guaranteed to have, and an unsupported keyword is a
+    # compile error that this engine would swallow as "unavailable". The
+    # atomic still carries the ordering that makes this stage's stores
+    # visible before the flag is.
+    tl.atomic_xchg(base + pid, 1)
     offs = tl.arange(0, FLAG_BLOCK)
     mask = offs < G
     spins = 0
     done = 0
     while (done == 0) & (spins < SPIN_LIMIT):
-        seen = tl.atomic_add(base + offs, 0, mask=mask, sem="acquire", scope="gpu")
-        done = tl.min(tl.where(mask, seen, 1), axis=0)
+        # volatile: the spin has to re-read memory every time, and a cached
+        # load here is the classic way a hand-rolled barrier hangs.
+        seen = tl.load(base + offs, mask=mask, other=1, volatile=True)
+        done = tl.min(seen, axis=0)
         spins += 1
     tl.debug_barrier()
 
