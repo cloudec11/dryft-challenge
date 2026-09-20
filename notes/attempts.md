@@ -904,3 +904,37 @@ load-plus-warmup gate, which is per workload and was never the binding one:
 identified**: 4bca974b and ac007ced were read as "superseded", and the v14
 session's "warmup change" (run 42b2ac2b, 864.45) was very likely fighting the
 same limit.
+
+## Run 21 (official 0b04c099, v19) - 874.79, and it diagnosed itself
+
+| | score | B1 TPOT | B4 TPOT | B16 TPOT | public-2 p50 | run duration |
+|---|---:|---:|---:|---:|---:|---:|
+| v17 `7fb8b308` | 882.98 | 3.958 | 4.925 | 4.913 | 732.2 | 9m34s |
+| v19 `0b04c099` | 874.79 | **4.352** | 4.906 | 4.904 | 727.8 | **6m38s** |
+
+The warmup cut worked: 6m38s against a 15-minute run limit, ~3 minutes of
+headroom recovered, and B4/B16 unchanged - so 30 s of tile tuning buys the
+same tiles 90 s did, as the 3% margin implied.
+
+B1 TPOT is the finding. 4.352 is not a slower tile, it is **the v1 path's own
+number** (4.29 in the v1 era), i.e. the fused step was rejected at batch 1 and
+the engine fell back.
+
+The cause was my own tightening, and it was wrong on one of the two checks.
+`_check_decode_attn` compares the split-K flash kernel against
+`decode_attention_ref`, which softmaxes in FP32 and multiplies FP32
+probabilities by V - while flash rounds the probabilities to BF16 before the
+PV product, as FlashAttention does. **That is a different formulation, not a
+different summation order**, and it is worth a few tenths of a percent on its
+own; the 2% tolerance was there for that reason. At 0.5% it rejects a correct
+kernel, `use_triton_attn` goes false, and then the fused step is compared
+against a v1 step running a *different* attention - so the 0.75-logit gate
+fails for a reason that has nothing to do with the fused step.
+
+Reverted to 2% there. The tightenings that stay are the ones where both sides
+of the comparison run the same code: fused-vs-reference step at 0.75 logits,
+and prefill GQA flash against expanded flash at 0.5%.
+
+Lesson worth keeping: **a tolerance is only as meaningful as the pair being
+compared.** Tightening a cross-formulation check does not buy correctness, it
+buys a fallback.
