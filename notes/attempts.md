@@ -793,3 +793,47 @@ beat the incumbent by the 3% margin.
 
 Also back to v8's warmup budgets (90 s / 25 s), since they were only trimmed
 to make room for the mega compile.
+
+## Run 19 (official 7fb8b308, v17) - 882.98, and what it rules out
+
+public-2 p50 = 732.2 puts this on the **slow** cluster, so compare it with the
+other slow-cluster run:
+
+| | score | B1 TPOT | B4 TPOT | B16 TPOT | public-2 p50 |
+|---|---:|---:|---:|---:|---:|
+| v8 restored `80b753b8` | 883.34 | 3.977 | 4.942 | 4.890 | 731.6 ms |
+| v17 `7fb8b308` | 882.98 | 3.958 | 4.925 | 4.913 | 732.2 ms |
+
+Identical, which is what v17 should look like on public shapes: its new tiles
+are only reachable at BLOCK_M >= 64 and the public shapes are batch 1, 4, 16.
+
+But the **hidden** score did not move either, and that is worth something:
+BLOCK_M is `next_pow2(batch)`, so BLOCK_M >= 64 needs batch >= 33. Either no
+hidden workload runs a batch that large, or the wider tiles did not win their
+races. Combined with the hidden geomean (900) sitting above the public one
+(686), the hidden set looks like **moderate batches with long outputs**, not
+batch 64+.
+
+(The run queued on the engine commit, `ac007ced`, was canceled by the
+platform when the notes-only commit superseded it, so v17 got one
+measurement rather than the two I expected.)
+
+## Where this leaves the engine
+
+Best: **904.33** (`c5011064`), which is the v8-class engine on a fast-cluster
+draw. Eleven runs of materially different engines still span 880-905, and two
+deliberate repeats of identical bytes span 2.2%.
+
+Hypotheses now tested: wave quantisation (real, not binding), split-K
+everywhere (no effect), activation re-reads (bytes real, stall not),
+prompt-lookup speculation (no acceptance on these prompts), large-batch tile
+coverage (no hidden effect). Launch count is **untested** rather than
+falsified - the kernel that would test it never ran on the device, three
+times, and a ranked run will not say why.
+
+The step budget still has ~1.46 ms of a 4.80 ms batch-16 step that arithmetic
+does not explain, and the gap to #1 (1431.93) is 58%. Both are profiler
+questions now. An hour of H100 time (~$2-3 on RunPod or Lambda) with
+`ncu --set full` on the decode graph answers: why the one-launch kernel does
+not run, and where that 1.46 ms goes. Blind, a run costs ~15 minutes and
+returns three numbers with a 2% error bar.
