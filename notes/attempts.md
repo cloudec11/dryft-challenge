@@ -747,3 +747,49 @@ portability trap. Those offsets are all inside int32 anyway.
 
 **So the arithmetic is no longer a suspect.** What remains untested offline is
 the multi-block barrier on real hardware, which is exactly what run 17 probes.
+
+## Runs 17-18: the one-launch layer never ran
+
+| run | commit | mega | score | B1 | B4 | B16 | public-2 p50 |
+|---|---|---|---:|---:|---:|---:|---:|
+| `84daa14e` | v8 | absent | 902.88 | 3.883 | 4.807 | 4.808 | 716.4 |
+| `e2e1d4d1` | v15 | raced | 900.69 | 3.891 | 4.817 | 4.805 | 717.5 |
+| `8083eec7` | v15 | forced | 885.95 | 3.952 | 4.913 | 4.888 | 727.3 |
+| `c5011064` | v15 | forced, 245 s budget | **904.33** | 3.890 | 4.812 | 4.794 | 713.1 |
+
+Run 18 is a new best score, but it is v8's engine on a good draw: every TPOT
+matches the fused step inside 0.3%. Forcing adoption on the logit check alone
+did not change any number either, and that only happens if the kernel never
+runs. Fixed between 17 and 18: my own 170 s cutoff (raised to 245 s, tuning
+budgets trimmed to fit) and the `sem=`/`scope=` atomic keywords (dropped in
+favour of a plain atomic plus a volatile spin load). Neither changed the
+outcome, so what is left is the barrier not holding on the device - or a
+launch-time resource failure - and **official runs hide the one line that
+would say which**.
+
+Called here. `kernels/layer.py` and `tests/test_layer_sim.py` stay in the
+tree, arithmetic verified offline and one flag from being testable, but
+`MEGA_ENABLED = False` so the attempt stops spending warmup time. Its
+expected payoff was ~0.4-0.7 ms of a 4.8 ms step; the gap to #1 is 58%.
+
+## v17: tiles for the batch sizes the hidden set probably uses
+
+Not a hypothesis about time, an outright gap in coverage. The projection
+tiles are filtered by shared memory before compiling, and at BLOCK_M 128 -
+which is what a hidden workload at batch 65-128 would use - the gate/up role
+had **exactly one** feasible tile, and BLOCK_M 64 had six of eight:
+
+| BLOCK_M | feasible, gate/up | feasible, others |
+|---:|---:|---:|
+| 16 | 7 of 8 | 8 of 8 |
+| 64 | 6 of 8 | 7 of 8 |
+| 128 | **1 of 6 before, 3 of 8 now** | 2 of 6 before, 4 of 8 now |
+
+The public shapes are batch 1, 4 and 16, so none of them ever exercise this,
+and the hidden set's tokens/sec geometric mean (900) sits well above the
+public shapes' (686), which is what larger batches look like. Two narrow-K
+tiles (BLOCK_K 64) go in at the end of the list, where they still have to
+beat the incumbent by the 3% margin.
+
+Also back to v8's warmup budgets (90 s / 25 s), since they were only trimmed
+to make room for the mega compile.

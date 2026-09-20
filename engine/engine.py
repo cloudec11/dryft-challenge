@@ -71,7 +71,14 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # Whether to build the one-launch-per-layer step at all, and the point in the
 # 300 s load-plus-warmup budget past which it is not worth starting: it is one
 # large kernel, and ptxas on it is the slowest compile in the engine.
-MEGA_ENABLED = True
+# Off: three runs (900.69 forced-off, 885.95 and 904.33 forced-on) all came
+# back with the fused step's per-shape numbers inside 0.3%, so the kernel
+# never ran, and official runs hide the one line that would say why. Leaving
+# the attempt enabled only spends warmup time. kernels/layer.py and
+# tests/test_layer_sim.py stay: the arithmetic is verified offline, so if a
+# profiler ever becomes available this is one flag away from being tested
+# properly.
+MEGA_ENABLED = False
 MEGA_DEADLINE_S = 245.0
 # Diagnostic: adopt the one-launch step whenever it is *correct*, skipping the
 # timing race. v15 came back indistinguishable from v8 on every shape (B16
@@ -81,15 +88,15 @@ MEGA_DEADLINE_S = 245.0
 # it separates them in one run: TPOT moves at all => it is correct and this is
 # its real speed; TPOT stays pinned to v8 => the logit check rejected it.
 # Latency gates have room for a slower step (native TPOT is ~36 ms).
-MEGA_FORCE = True
+MEGA_FORCE = False
 # Largest batch the fused decode step is tried at (it is BLOCK_M of its GEMMs).
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
 FUSED_MAX_BATCH = 128
 # Warmup seconds allowed for tuning the fused step's GEMM tiles, and for the
 # decode attention tile shape.
-TUNE_BUDGET_S = 55.0
-ATTN_TUNE_BUDGET_S = 12.0
+TUNE_BUDGET_S = 90.0
+ATTN_TUNE_BUDGET_S = 25.0
 # A later candidate has to win by this much to displace an earlier one. Runs
 # vary by ~1-2% on identical code, so picking the bare minimum of a set of
 # noisy measurements is how a tuner talks itself into a worse configuration;

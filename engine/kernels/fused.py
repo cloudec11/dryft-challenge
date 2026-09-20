@@ -234,6 +234,13 @@ GEMV_CANDIDATES = (
     GemvConfig(32, 128, 4, 4),
     GemvConfig(64, 128, 4, 4),
     GemvConfig(64, 256, 3, 8),
+    # Narrow K, for large BLOCK_M. A hidden workload at batch 32-128 runs
+    # these projections with BLOCK_M 32-128, where every tile above keeps
+    # more than the 227 KiB an SM has and gets filtered out unbuilt; the
+    # public shapes (batch 1, 4, 16) never exercise that. Last in the list,
+    # so they still have to beat the incumbent by MARGIN.
+    GemvConfig(32, 64, 4, 4),
+    GemvConfig(64, 64, 4, 4),
 )
 
 
