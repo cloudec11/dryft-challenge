@@ -976,3 +976,48 @@ That is a guard, not a diagnosis. Being honest about the state of it: with
 no engine stdout and correctness reported only as one flag per run, a
 non-deterministic wrong token on an unseen shape is close to the worst case
 this feedback channel can describe.
+
+## Run 23 (official 512d602c, v21) - 868.48, B1 still slow: it was my gate
+
+Raising the candidate cap did not restore batch 1 either (TPOT 4.358). Three
+theories, three wrong: attention tolerance, candidate starvation, kernel
+numerics (the kernels are bit-exact offline). What is left is the gate itself,
+and the mistake is in the statistic:
+
+`max_d` is a maximum over the **whole vocabulary** - 456k comparisons at batch
+1, 7.3M at batch 16 - and `QWEN_ENGINE_CONTRACT.md` says native Qwen replayed
+against itself sits **up to 0.75 logits** below the replay argmax at rare
+positions. So a 0.75 threshold on a max-over-vocabulary statistic is set at
+the model's own noise floor, and it rejects healthy configurations. 1.5 was
+chosen for that reason.
+
+It also explains why only batch 1 moved: rejection falls back to the v1 path,
+and that path is 11% slower at batch 1 (the single-row kernel is worth a lot
+there) but within 1% at batch 4 and 16.
+
+Reverted to 1.5, keeping the tighter `mean_d <= 0.05`, which is the half of
+the test that means something. Net effect of v19-v21 on correctness: zero -
+the hidden failures happened under both thresholds.
+
+## v22 also caps the attention split count at 8
+
+A real, shape-dependent numerical suspect for the hidden failures. Every
+split is one more rescaling of the running softmax, and the split count is
+chosen to fill the device:
+
+| capacity | batch | splits before | after cap |
+|---:|---:|---:|---:|
+| 544 | 1 | 9 | 5 |
+| 2080 | 4 | 9 | 7 |
+| 640 | 16 | 3 | 3 |
+| **4224** | **1** | **33** | **8** |
+| **8320** | **2** | **17** | **8** |
+
+The three public shapes take 3 to 9 splits. A long-context hidden shape would
+take 17 or 33, stacking that many rescalings on top of every other reordering
+the engine already does - and the failures are hidden-only. 8 still fills the
+device (8 x batch x kv_heads programs) and bounds the reduction depth.
+
+Unlike the three wrong theories above, this one is not contradicted by
+anything in the log: it predicts failures on long-context hidden shapes only,
+which is exactly what two runs have shown.
