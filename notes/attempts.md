@@ -415,3 +415,102 @@ and `spec measured` are not available as feedback. Compare paired official
 runs one change at a time, using the result page's visible public-workload
 TTFT, TPOT, throughput, and spread where available; the six hidden workloads
 remain the ranking signal.
+
+## v11: rewrite around the decode step's byte and launch budget
+
+Design note: `notes/v11-design.md`. The v10 engine is kept verbatim under
+`notes/v10/`. Same skeleton as v8/v10 -- packed weights, static KV cache,
+CUDA-graphed decode, five launches per layer -- with the four projection
+kernels collapsed into one `kernels/proj.py` specialised on
+`NORM`/`GLU`/`RES`/`SPLIT`, tiles derived from the device instead of a fixed
+list (`BLOCK_N x BLOCK_K x split x stages x warps`, sorted by wave
+efficiency then bytes in flight per SM), producers preferring wide tiles to
+shrink the sum-of-squares hand-off, and speculation dropped.
+
+The premise was wave quantisation: the two `N = hidden` projections (o,
+down) are 33% of the layer's weight bytes and, at `BLOCK_N=16`, run 160
+programs on 132 SMs for 61% occupancy.
+
+### v11 result
+
+Run `91b25bef`, commit `09c3f866`. Score **898.54**, ranked, all three
+public shapes correct, peak memory 20.3 GB of 80.
+
+| | v8 `84daa14e` | v10 `be619c9a` | main `d6358959` | v11 `91b25bef` |
+|---|---:|---:|---:|---:|
+| score | **902.88** | 900.88 | 884.56 | 898.54 |
+| public-0 p50 ms | 130.94 | 131.92 | 133.65 | 134.40 |
+| public-0 TPOT ms | 3.883 | 3.918 | 3.964 | 3.990 |
+| public-1 p50 ms | 265.43 | 267.95 | 271.10 | 266.56 |
+| public-1 TPOT ms | 4.807 | 4.830 | 4.905 | 4.832 |
+| public-2 p50 ms | 716.38 | 716.41 | 731.20 | 717.28 |
+| public-2 TPOT ms | 4.808 | 4.805 | 4.910 | 4.803 |
+
+Read this as three separate facts.
+
+1. **The aggregate is a non-result.** 898.54 against v8's 902.88 is -0.48%,
+   inside the 1-2% between-run noise. The rewrite reproduced v8 rather than
+   beating it. It did recover the 884.56 regression that `b285c46` put on
+   main (+1.6%), so main is back at the v8 plateau.
+
+2. **The wave-efficiency premise is falsified, at least as implemented.**
+   B16 TPOT is 4.803 ms against v8's 4.808 -- identical to three decimals on
+   the shape the whole design targeted. Either the tuner kept the incumbent
+   16x256 tile everywhere (the 3% margin doing its job), or wider/deeper
+   tiles balanced the grid without buying bandwidth, which would mean the
+   61% occupancy figure was never the binding constraint. **These two cases
+   are indistinguishable from the metrics available**, which is the real
+   finding of this run (see 4).
+
+3. **Batch 1 regressed ~2.7% and it is the one live signal.** public-0 TPOT
+   has drifted monotonically 3.883 -> 3.918 -> 3.964 -> 3.990 across v8, v10,
+   main, v11, while B4 and B16 returned to v8 levels. A monotone drift across
+   four runs is not noise. v11's suspect is the new batch-1
+   `_proj_vec_kernel`: its race measures one role in isolation, so a kernel
+   that wins its own race can still lose inside the step (different cache
+   state, different tail effects). Worth one targeted A/B.
+
+4. **The instrumentation does not reach us.** Point 4 of the design note --
+   log achieved GB/s per role so one run says where the missing 40% is --
+   returns nothing. `GET /api/v1/runs/{id}/logs` on an official run yields
+   five harness lines and an explicit refusal: output written by the
+   submission is not shown because a hidden case's dimensions can be encoded
+   into arbitrary text. There is no public-run channel on this deployment.
+   **Any future design that pays complexity for a diagnostic printed to
+   stderr is paying for nothing.** The only feedback loop is: one change per
+   run, read the three public p50/TPOT/TTFT numbers, require >2% to believe
+   it.
+
+### Where that leaves the gap
+
+#1 is now 1280.44 (was 1144 when v11 was designed); we are #24 of 56 at
+902.88. The bar is +42%, and the byte budget in `v11-design.md` says a
+perfect 3.35 TB/s stream of 8.05 GB of weights is 2.40 ms against our
+measured 4.80 ms -- so even flawless streaming is +100% on the decode
+component and the leaders are plainly not just tuning tiles. Three
+candidates the budget cannot rule out, in order of expected value per unit
+of risk:
+
+- **Speculation with a verified draft.** The only quantity that moves decode
+  past the bandwidth floor is tokens emitted per weight-stream. v10's n-gram
+  draft failed because sample prompts are random token ids with nothing to
+  match; that is a fact about the *draft source*, not about speculation. The
+  contract is explicit that "a speculative decoder with exact verification
+  passes by construction" (`QWEN_ENGINE_CONTRACT.md:121-123`), and the
+  prohibition in `AGENTS.md:92-94` is on a draft model used *without*
+  verification. So the draft may be arbitrarily cheap -- that is the whole
+  point of verifying it -- while the verify step stays exact BF16. This is
+  the one lever with a factor in it, and it is most plausibly what a 1280 is.
+  v10 already built the hard half: exact verification through the fused step
+  at ~1.1x a plain step. What it lacked was a draft worth verifying.
+- **The megakernel**, rejected in v11 for lack of a GPU to debug a hang on.
+  Worth ~0.4 ms/step (~8%), not 42%.
+
+Ruled out, and recorded here so it is not re-proposed: **quantising the
+model weights** to cut the 8.05 GB stream. It is the obvious reading of the
+byte budget and it is wrong. `CONTEXT.md:189` and `AGENTS.md:92` both say
+never, and `QWEN_ENGINE_CONTRACT.md:117-119` gives the reason -- a quantized
+model shifts logits by whole units on some prompt, and one failing position
+fails the whole workload. The 2.0-logit margin was calibrated on BF16
+reduction-order noise, not on representation error. A quantized *draft*
+under exact verification is a different thing and is allowed; see above.
