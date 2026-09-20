@@ -123,7 +123,7 @@ def _layer_kernel(
         split = unit % SPLITS
         start = split * chunk
         end = tl.minimum(start + chunk, seq_len)
-        row = qkv_ptr + b.to(tl.int64) * N_QKV
+        row = qkv_ptr + b * N_QKV
         heads = kvh * GROUP + offs_h
 
         xq = tl.load(row + heads[:, None] * D + offs_d[None, :], mask=h_ok[:, None],
@@ -151,7 +151,7 @@ def _layer_kernel(
         k_new = ((yk * c).to(dt).to(tl.float32) + (rotk * s).to(dt).to(tl.float32)).to(dt)
         v_new = tl.load(row + (NQ + NKV + kvh) * D + offs_d)
 
-        base = b.to(tl.int64) * stride_cb + kvh * stride_ch
+        base = b * stride_cb + kvh * stride_ch
         m_i = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
         acc_a = tl.zeros([BLOCK_H, D], dtype=tl.float32)
@@ -178,7 +178,7 @@ def _layer_kernel(
         tl.store(v_ptr + new_off, v_new, mask=(offs_d < D) & owner)
         if SPLITS == 1:
             o = (acc_a / l_i[:, None]).to(dt)
-            tl.store(attn_ptr + b.to(tl.int64) * (NQ * D) + heads[:, None] * D + offs_d[None, :],
+            tl.store(attn_ptr + (b * NQ + heads)[:, None] * D + offs_d[None, :],
                      o, mask=h_ok[:, None])
         else:
             part = (b * NQ + heads).to(tl.int64) * n_splits + split
@@ -193,7 +193,7 @@ def _layer_kernel(
         for unit in range(pid, BATCH * NQ, G):
             b = unit // NQ
             head = unit % NQ
-            part = (b * NQ + head).to(tl.int64) * n_splits + offs_s
+            part = offs_s + (b * NQ + head) * n_splits
             s_ok = offs_s < n_splits
             mm = tl.load(pm_ptr + part, mask=s_ok, other=float("-inf"))
             ll = tl.load(pl_ptr + part, mask=s_ok, other=0.0)
@@ -203,7 +203,7 @@ def _layer_kernel(
             oo = tl.load(po_ptr + part[:, None] * D + offs_d[None, :], mask=s_ok[:, None],
                          other=0.0)
             red = tl.sum(oo * wgt[:, None], axis=0) / l_sum
-            tl.store(attn_ptr + b.to(tl.int64) * (NQ * D) + head * D + offs_d, red.to(dt))
+            tl.store(attn_ptr + (b * NQ + head) * D + offs_d, red.to(dt))
         _arrive_and_wait(flag_ptr, slot0 + 2, pid, G, FLAG_BLOCK)
 
     # ---- stage 3: O projection, residual add in place, sums of squares

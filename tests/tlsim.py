@@ -205,9 +205,39 @@ def store(ptr, value, mask=None, cache_modifier=None, eviction_policy=None):
 
 
 def atomic_add(ptr, value, mask=None, sem=None, scope=None):
-    idx = int(ptr.indices())
-    old = ptr.buf[idx]
-    ptr.buf[idx] = old + np.asarray(value)
+    """Scalar or elementwise atomic add; returns the old value(s)."""
+    idx = ptr.indices()
+    if np.ndim(idx) == 0:
+        i = int(idx)
+        old = ptr.buf[i]
+        ptr.buf[i] = old + np.asarray(value)
+        return T(old)
+    idx = np.asarray(idx)
+    old = ptr.buf[idx].copy()
+    add = np.broadcast_to(np.asarray(value), idx.shape)
+    if mask is None:
+        ptr.buf[idx] = old + add
+    else:
+        m = np.asarray(mask)
+        ptr.buf[idx[m]] = old[m] + add[m]
+    return T(old)
+
+
+def atomic_xchg(ptr, value, mask=None, sem=None, scope=None):
+    idx = ptr.indices()
+    if np.ndim(idx) == 0:
+        i = int(idx)
+        old = ptr.buf[i]
+        ptr.buf[i] = np.asarray(value)
+        return T(old)
+    idx = np.asarray(idx)
+    old = ptr.buf[idx].copy()
+    new = np.broadcast_to(np.asarray(value), idx.shape)
+    if mask is None:
+        ptr.buf[idx] = new
+    else:
+        m = np.asarray(mask)
+        ptr.buf[idx[m]] = new[m]
     return T(old)
 
 
@@ -225,6 +255,10 @@ def sum(x, axis=None):
 
 def max(x, axis=None):
     return T(np.max(np.asarray(x), axis=axis))
+
+
+def min(x, axis=None):
+    return T(np.min(np.asarray(x), axis=axis))
 
 
 def maximum(a, b):
