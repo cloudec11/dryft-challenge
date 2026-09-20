@@ -655,3 +655,56 @@ measuring the distance between two implementations on a state neither would
 ever see, and the run page cannot tell you that: official runs show no engine
 output, so a silent fallback and a real regression look identical from here.
 The only defence is that every fallback be a small step down.
+
+## Run 15 (official 80b753b8) - the v8 engine again, 883.34
+
+engine/ byte-identical to `cd5ef7ce`, which scored **902.88**. This run:
+**883.34**, 2.2% lower.
+
+| | score | B1 TPOT | B4 TPOT | B16 TPOT | public-2 p50 |
+|---|---:|---:|---:|---:|---:|
+| v8 `84daa14e` | 902.88 | 3.883 | 4.807 | 4.808 | 716.4 ms |
+| v8 again `80b753b8` | 883.34 | 3.977 | 4.942 | 4.890 | 731.6 ms |
+
+Second independent confirmation of ~2% run noise on identical bytes, and it
+lands exactly on the two clusters `notes/findings.md` guessed at: public-2
+p50 is either ~716 ms or ~731 ms, never between. v14 measured 747.3 ms on
+that shape, outside both clusters, so restoring v8 over v14 was right even
+though v8-vs-v8 spans 2.2%.
+
+**Practical rule from this: read public-2 p50 first to tell which machine a
+run landed on, then compare TPOT within the cluster.**
+
+## v15: one launch per layer (`kernels/layer.py`)
+
+The only cost in the step budget that is measured rather than modelled: v6
+removed 36 launches per step and B16 batch time fell 12 ms over 127 steps =
+**2.8 us per launch**. The fused step issues 5 per layer, 185 per step, so
+~0.52 ms of a 4.80 ms step is launch overhead, and every launch also refills
+the memory pipeline from empty. v12 already falsified the byte-counting
+hypothesis; this attacks the one term with direct evidence behind it.
+
+- One kernel runs a whole layer: norm+QKV, attention (Q/K norm, RoPE, KV
+  write, flash decoding), reduce, O+residual, norm+gate/up+SwiGLU,
+  down+residual, with grid-wide barriers between stages. 41 launches per step
+  instead of 185.
+- Arithmetic lifted unchanged from `fused.py`/`ops.py` - same rounding
+  points, same sum-of-squares hand-off - so the existing logit check against
+  the reference step is a valid test of it.
+- Barriers: arrive-and-wait on a per-(layer, stage) row of flags, zeroed once
+  per step. Two properties make it safe to try without a GPU to test on:
+  **the spin is bounded** (a deadlock would burn the 300 s budget and fail
+  every workload; after 4M polls a block proceeds instead, which turns a hang
+  into a wrong number that validation catches), and **the flag writes are
+  idempotent** (so it does not matter whether Triton emits the scalar store
+  per block or per thread).
+- Grid is one block per SM so all blocks are resident; stages are
+  grid-strided, so any grid is correct, only faster or slower. Widest stage
+  needs 108 KiB of shared memory, inside the 228 KiB an SM has.
+- Gated: skipped if shared memory exceeds 200 KiB, if the logit check fails,
+  if it loses the timing race by v8's 3% margin, or if load+warmup is already
+  past 170 s when its turn comes (it is the slowest compile in the engine).
+
+Expected: -0.4 ms/step from launches alone, more if the per-launch pipeline
+refill matters, i.e. 8-15% on decode. Not enough for #1 at 1431, but it is
+the largest term left that the log actually supports.

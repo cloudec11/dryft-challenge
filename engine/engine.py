@@ -53,6 +53,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from kernels import fused, ops  # noqa: E402
+from kernels import layer as megakernel  # noqa: E402
 
 try:  # PyTorch >= 2.3
     from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
@@ -67,6 +68,11 @@ LOOKAHEAD = 3
 # graph at warmup and kept only if the replay beats the eager prefill. Larger
 # ones are GPU-bound anyway and their activations would sit in a graph pool.
 PREFILL_GRAPH_MAX_TOKENS = 16384
+# Whether to build the one-launch-per-layer step at all, and the point in the
+# 300 s load-plus-warmup budget past which it is not worth starting: it is one
+# large kernel, and ptxas on it is the slowest compile in the engine.
+MEGA_ENABLED = True
+MEGA_DEADLINE_S = 170.0
 # Largest batch the fused decode step is tried at (it is BLOCK_M of its GEMMs).
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
@@ -122,6 +128,7 @@ class _ShapeState:
         self.prefill_ids = None
         self.prefill_out = None
         self.fused = None  # _FusedPlan when the fused step is in use
+        self.layer = None  # layer.LayerPlan when the one-launch step is in use
 
 
 class _FusedPlan:
@@ -175,6 +182,7 @@ class Engine:
         from transformers import AutoModelForCausalLM
 
         start = time.perf_counter()
+        self._t0 = start
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         props = torch.cuda.get_device_properties(0)
@@ -629,7 +637,7 @@ class Engine:
         if ok:
             st.attn = attn
 
-    def _check_fused(self, st, prompt_len, new_tokens):
+    def _check_fused(self, st, prompt_len, new_tokens, step_fn=None):
         """Logits of the fused step vs the v1 step on the same synthetic
         prompt and the same forced tokens, over a few consecutive steps."""
         batch = st.batch
@@ -638,6 +646,7 @@ class Engine:
         prompt = torch.randint(100, 100000, (batch, prompt_len), generator=gen).to(self.device)
         toks = torch.randint(100, 100000, (n_check, batch), generator=gen).to(self.device)
         self._prefill(st, prompt)
+        step_fn = step_fn or self._decode_step_fused
         refs = []
         for t in range(n_check):
             st.pos.fill_(prompt_len + t)
@@ -648,7 +657,7 @@ class Engine:
         for t in range(n_check):
             st.pos.fill_(prompt_len + t)
             st.ids.copy_(toks[t])
-            got = self._decode_step_fused(st).float()
+            got = step_fn(st).float()
             if not torch.isfinite(got).all():
                 return False, "non-finite logits"
             diff = (got - refs[t]).abs()
@@ -720,6 +729,61 @@ class Engine:
         else:
             st.fused = None
 
+    def _decode_step_mega(self, st):
+        """One token per sequence, one launch per layer (v15).
+
+        Same arithmetic as the fused step; the difference is that a layer's
+        five stages are separated by grid barriers inside one kernel instead
+        of by five kernel launches. 41 launches per step instead of 185."""
+        f, lp = st.fused, st.layer
+        m, bm, eps, hid = f.m, f.bm, self.eps, f.hidden
+        lp.flags.zero_()  # one memset per step arms every barrier
+        fused.embed_ssq(st.ids, self.embed_w, f.h, f.ssq_b)
+        parts = 1
+        for i, lay in enumerate(self.layers):
+            megakernel.layer_forward(self, st, lp, i, lay, f.h, f.ssq_b, parts,
+                                f.qkv, lp.attn_buf, f.act, f.ssq_a, f.ssq_b)
+            parts = lp.parts_dn
+        fused.gemv(f.h, self.lm_w, f.logits, m, f.vocab, hid, f.cfg["lm"], bm,
+                   f.ssq_b, f.ssq_a, eps, norm_w=self.norm_w, n_parts=parts,
+                   parts_block=lp.parts_block, part=f.part)
+        self._argmax_into(f.logits, st.ids)
+        st.pos.add_(1)
+        return f.logits
+
+    def _try_mega(self, st, prompt_len, new_tokens):
+        """Build the one-launch-per-layer step, check it against the v1 step
+        and race it against whatever is currently fastest."""
+        start = time.perf_counter()
+        st.layer = megakernel.LayerPlan(self, st.batch, st.capacity, st.fused.bm)
+        lp = st.layer
+        if lp.smem_bytes() > 200 * 1024:
+            _log(f"mega step skipped: {lp.smem_bytes() // 1024} KiB of shared memory per block")
+            st.layer = None
+            return
+        ok, detail = self._check_fused(st, prompt_len, new_tokens,
+                                      step_fn=self._decode_step_mega)
+        _log(f"mega step vs v1: {detail} -> {'ok' if ok else 'REJECTED'}")
+        if not ok:
+            st.layer = None
+            return
+        graph = self._capture(st, self._decode_step_mega)
+        reps = min(16, new_tokens)
+        t_cur, t_mega = [], []
+        for _ in range(2):
+            t_cur.append(self._time_graph(st, st.graph, prompt_len, reps))
+            t_mega.append(self._time_graph(st, graph, prompt_len, reps))
+        t_cur, t_mega = min(t_cur), min(t_mega)
+        use = t_mega < t_cur * MARGIN
+        _log(f"decode step: current {t_cur:.3f} ms, mega {t_mega:.3f} ms "
+             f"({lp.grid} blocks, {lp.splits} attention splits) -> "
+             f"{'mega' if use else 'keep'} (setup {time.perf_counter() - start:.1f}s)")
+        if use:
+            st.graph = graph
+            st.step = self._decode_step_mega
+        else:
+            st.layer = None
+
     # ------------------------------------------------------------- generation
 
     def _state_for(self, batch, prompt_len, new_tokens):
@@ -753,6 +817,14 @@ class Engine:
                     _log(f"fused step unavailable: {type(exc).__name__}: {str(exc)[:300]}")
                     st.fused = None
                     st.step = self._decode_step
+            elapsed = time.perf_counter() - getattr(self, "_t0", time.perf_counter())
+            if st.fused is not None and MEGA_ENABLED and elapsed < MEGA_DEADLINE_S:
+                try:
+                    self._try_mega(st, prompt_len, new_tokens)
+                except Exception as exc:
+                    torch.cuda.synchronize()
+                    _log(f"mega step unavailable: {type(exc).__name__}: {str(exc)[:300]}")
+                    st.layer = None
         if self.use_graphs and batch * prompt_len <= PREFILL_GRAPH_MAX_TOKENS:
             try:
                 self._capture_prefill(st, batch, prompt_len)
@@ -764,7 +836,7 @@ class Engine:
         _log(f"shape B={batch} S={prompt_len} N={new_tokens}: capacity {st.capacity}, "
              f"{st.attn.splits} attention splits, graph={'yes' if st.graph else 'no'}, "
              f"prefill_graph={'yes' if st.prefill_graph else 'no'}, "
-             f"step={'fused' if st.fused is not None else 'v1'}, "
+             f"step={'mega' if st.layer is not None else ('fused' if st.fused is not None else 'v1')}, "
              f"setup {time.perf_counter() - start:.2f}s")
         return st
 
