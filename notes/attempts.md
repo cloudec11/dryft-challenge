@@ -1050,3 +1050,35 @@ limit is real but not close: v17 at 90/25 took 9m34s and v22 at 50/8 took
 9m10s, both against 15 minutes. That leaves exactly one un-reverted change
 that can touch batch-1 speed - the cache-policy race - so if batch 1 comes
 back, the gates were the cause; if it does not, `_try_stream` is.
+
+## Run 25 (official 9c0a3f59, v23) - 907.54, BEST, and batch 1 fixed
+
+| | score | B1 TPOT | B4 TPOT | B16 TPOT | public-2 p50 |
+|---|---:|---:|---:|---:|---:|
+| v8 `84daa14e` | 902.88 | 3.883 | 4.807 | 4.808 | 716.4 |
+| v22 `db305dcc` | 870.74 | 4.322 | 4.913 | 4.905 | 730.1 |
+| **v23 `9c0a3f59`** | **907.54** | **3.781** | 4.826 | 4.830 | 718.9 |
+
+B1 TPOT 3.781 is the best single number in the whole log (previous best 3.863)
+and it had been stuck at ~4.33 for four runs. So the batch-1 regression was
+**the gate thresholds**, as the BF16 ulp argument predicted: `mean_d <= 0.05`
+is below what two valid summation orders produce on logits whose ulp is
+0.125-0.25 at magnitude 16-32, so it rejected a healthy fused step and batch
+1 fell back to the v1 path, where the single-row kernel is worth 11%.
+
+Batch 1 is also now *better* than it has ever been, by 2.6% against v8, which
+must come from one of the three changes that survived the revert: the split
+cap (batch 1 goes from 9 splits to 5), the cache-policy race, or full-budget
+tuning finding a better tile. Not separable from here.
+
+### The expensive lesson
+
+v19 changed six things in one commit: two warmup budgets, a candidate cap,
+two gate thresholds, one load-check tolerance, and it inherited v18's stream
+race. Unpicking it cost **four runs**, and the thing that mattered was a
+threshold I had tightened on a hunch rather than on a measurement.
+
+Under a 2% noise floor, bundling is not cheap - it is the most expensive way
+to spend runs, because a bundle can only be debugged by reverting it one
+piece at a time, at 15 minutes each. One change per run, and gate thresholds
+count as changes.
