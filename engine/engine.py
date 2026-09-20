@@ -73,6 +73,15 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # large kernel, and ptxas on it is the slowest compile in the engine.
 MEGA_ENABLED = True
 MEGA_DEADLINE_S = 170.0
+# Diagnostic: adopt the one-launch step whenever it is *correct*, skipping the
+# timing race. v15 came back indistinguishable from v8 on every shape (B16
+# TPOT 4.805 vs 4.808 on the same machine cluster), which means the fused step
+# ran -- but the metrics cannot say whether the mega step was rejected by the
+# logit check or merely lost the race, and those have opposite fixes. Forcing
+# it separates them in one run: TPOT moves at all => it is correct and this is
+# its real speed; TPOT stays pinned to v8 => the logit check rejected it.
+# Latency gates have room for a slower step (native TPOT is ~36 ms).
+MEGA_FORCE = True
 # Largest batch the fused decode step is tried at (it is BLOCK_M of its GEMMs).
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
@@ -774,7 +783,7 @@ class Engine:
             t_cur.append(self._time_graph(st, st.graph, prompt_len, reps))
             t_mega.append(self._time_graph(st, graph, prompt_len, reps))
         t_cur, t_mega = min(t_cur), min(t_mega)
-        use = t_mega < t_cur * MARGIN
+        use = MEGA_FORCE or t_mega < t_cur * MARGIN
         _log(f"decode step: current {t_cur:.3f} ms, mega {t_mega:.3f} ms "
              f"({lp.grid} blocks, {lp.splits} attention splits) -> "
              f"{'mega' if use else 'keep'} (setup {time.perf_counter() - start:.1f}s)")
