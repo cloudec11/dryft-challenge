@@ -708,3 +708,42 @@ hypothesis; this attacks the one term with direct evidence behind it.
 Expected: -0.4 ms/step from launches alone, more if the per-launch pipeline
 refill matters, i.e. 8-15% on decode. Not enough for #1 at 1431, but it is
 the largest term left that the log actually supports.
+
+## Run 16 (official e2e1d4d1, v15 one-launch layer) - 900.69
+
+| | score | B1 TPOT | B4 TPOT | B16 TPOT | public-2 p50 |
+|---|---:|---:|---:|---:|---:|
+| v8 `84daa14e` | 902.88 | 3.883 | 4.807 | 4.808 | 716.4 ms |
+| v15 `e2e1d4d1` | 900.69 | 3.891 | 4.817 | 4.805 | 717.5 ms |
+
+public-2 p50 of 717.5 puts this run on the **fast** cluster, the same one
+v8's 902.88 came from, so this is a within-cluster comparison for once. Every
+number matches v8 inside 0.2%. That is not a slower engine, it is **the same
+code path**: the fused step ran and the one-launch step did not.
+
+The metrics cannot say which gate stopped it - the logit check or the timing
+race - and those have opposite fixes, so run 17 forces adoption on the logit
+check alone (`MEGA_FORCE`). Native TPOT is ~36 ms against our 4.8, so even a
+much slower step clears the 1.10x gate and still reports numbers.
+
+## The kernel is checked offline now (`tests/test_layer_sim.py`)
+
+`tests/tlsim.py`, from the v11 session, executes a Triton kernel's own source
+over numpy with BF16 rounding. **With a grid of one block, every barrier in
+the layer kernel is satisfied by its own arrival**, so the whole layer runs
+offline. The other side of the comparison is the layer as tensor algebra in
+torch bfloat16, sharing no code with the kernel.
+
+Both attention modes pass - one split (4 barriers, reduce skipped) and two
+splits (5 barriers, partials plus reduce) - on the residual stream, attention
+output, SwiGLU, both sums-of-squares hand-offs, and the KV writes (exactly).
+A third case lowers `SPIN_LIMIT` and runs two blocks, which in a sequential
+simulator is exactly a deadlock: the kernel returns in 0.04 s instead of
+hanging, so the safety valve works.
+
+It paid for itself immediately: loop-derived scalars are Python ints in the
+simulator and int32 tensors in Triton, so `.to(tl.int64)` on them is a
+portability trap. Those offsets are all inside int32 anyway.
+
+**So the arithmetic is no longer a suspect.** What remains untested offline is
+the multi-block barrier on real hardware, which is exactly what run 17 probes.
