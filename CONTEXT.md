@@ -112,8 +112,8 @@ Python 3.11, CUDA 12.4, PyTorch 2.5.1, **Triton 3.1.0** (check APIs against
 tokenizers 0.21.1.
 
 The engine runs as an unprivileged user with read-only access to the
-checkpoint. The submission root is on `sys.path`, so import with
-`from kernels.rmsnorm import rms_norm`.
+checkpoint. The submission root is on `sys.path`, so a module beside
+`engine.py` is imported by name: `import planner`, `from kernels import gemm`.
 
 **Packaging limits:**
 - 2 MiB compressed, 16 MiB expanded, 200 files.
@@ -196,13 +196,24 @@ order.
 
 | Path | Submitted | Notes |
 | --- | --- | --- |
-| `engine/engine.py` | yes | Baseline: `AutoModelForCausalLM` with BF16 and `attn_implementation="sdpa"`. It calls `model(...)` every step with `past_key_values`, `use_cache=True`, `logits_to_keep=1`, then argmax and `.tolist()`. |
-| `engine/kernels/rmsnorm.py` | yes | Triton RMSNorm matching the reference cast placement. `rms_norm(x, weight, eps)` allocates its output. Not imported by the baseline. |
+| `engine/engine.py` | yes | The engine: load-time kernel checks, warmup calibration and tuning, CUDA-graphed decode, chunked prefill, streaming `generate`. |
+| `engine/model.py` | yes | Checkpoint load, weight packing (`qkv`, `gate_up`), RoPE tables, per-role dimensions. |
+| `engine/planner.py` | yes | The decode plan: device constants, the traffic model, and the tile candidates. No torch, no triton — testable without a GPU. |
+| `engine/kernels/gemm.py` | yes | The projection kernel every decode matrix product runs on, with the elementwise work fused in and split-K reduced inside the same launch. |
+| `engine/kernels/attention.py` | yes | Single-token GQA over the fixed-capacity KV cache, head norm + RoPE + cache write folded in, split softmaxes merged in the same launch. |
+| `engine/kernels/elementwise.py` | yes | Embedding, prefill head norm + RoPE + cache write, SwiGLU, RMSNorm. |
+| `engine/kernels/reference.py` | yes | PyTorch twins of every kernel. The load-time judge, and the fallback when one disagrees. |
 | `agent/package.py` | no | Builds a reproducible tar.gz from `engine/` and enforces the platform limits (checks `engine.py` exists and defines `class Engine`). |
 | `agent/client.py` | no | Standard-library API client `Dryft` with `benchmark()`, `submit(bytes)`, `start_run(id, mode)`, `run(id)`, `logs(id)`, and `wait(id)`. Needs `DRYFT_API` and `DRYFT_TOKEN`. |
 | `agent/loop.py` | no | `attempt()` runs package → submit → run → `report()`, which prints per-workload speedup and TTFT/TPOT ratios and flags `OVER GATE` above 1.10. `plan_next_edit()` is an unimplemented stub for you to write. |
 | `bin/` | no | Target for the Dryft CLI (`install-dryft.sh` or `install-dryft.ps1`). |
+| `tests/test_planner.py` | no | The decode plan's invariants and the calibration round-trip. Runs anywhere. |
+| `tests/test_kernels_sim.py` | no | The Triton kernels' own source, run over numpy by `tests/tlsim.py`, against the twins. Triton's own interpreter cannot do this: it returns garbage for CPU tensors. |
+| `tests/test_engine_cpu.py` | no | The whole engine against Transformers' Qwen3 on a tiny model. Needs CPU torch. |
 | `tests/test_client.py` | no | Unit tests for the client. |
+
+Run the three engine suites with `python tests/<name>.py`; none of them needs a
+GPU, pytest, or the checkpoint.
 
 ## 9. Submitting
 
