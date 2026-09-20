@@ -74,6 +74,7 @@ import torch.nn.functional as F  # noqa: E402
 
 import model as checkpoint  # noqa: E402
 import planner  # noqa: E402
+from model import ROLES  # noqa: E402
 from kernels import (  # noqa: E402
     attention as kattn,
     elementwise as kelem,
@@ -117,10 +118,22 @@ MARGIN = 0.97
 TILE_MARGIN = 0.995
 # Warmup seconds for the projection tiles and the attention tile.  The
 # projection budget is spent once per distinct batch, not once per shape.
-# Load plus one warmup generation share a 300-second budget.  Loading the
-# checkpoint is 30 to 60 seconds of it and a Triton specialisation costs a few
-# seconds to compile, so these two are most of what is left: each is a
-# deadline, checked before a candidate is compiled, never a promise.
+# Load plus one warmup generation share a 300-second budget, and going over
+# it is ``timeout``: the whole run, not just the tuning.  So the two tuning
+# budgets below are ceilings, not plans -- what each phase actually gets is
+# whatever is left of WARMUP_BUDGET_S from the moment __init__ began, which is
+# the only clock that matches the gate.  Loading the checkpoint is 30 to 60
+# seconds of it and a Triton specialisation costs a few seconds to compile, so
+# on a slow machine there may be nothing left, and the engine has to be as
+# correct then as when there is plenty.
+WARMUP_BUDGET_S = 255.0
+# Held back from tuning for what has to happen afterwards whatever else does
+# not: the fused step's check against the reference, the decode graph capture,
+# and the warmup generation the platform is timing this budget against.
+RESERVE_S = 35.0
+# Below this much left, the fused step is not even checked -- the check and
+# its race are two graph captures and six eager steps.
+FUSED_CHECK_S = 22.0
 TUNE_BUDGET_S = 70.0
 ATTN_TUNE_BUDGET_S = 25.0
 CAND_LIMIT = 6
@@ -234,7 +247,9 @@ class Engine:
     """The platform's entry point.  Two methods, and everything else private."""
 
     def __init__(self, model_path: str) -> None:
-        start = time.perf_counter()
+        # Before anything else, including the load: this is the clock the
+        # 300-second gate runs on.
+        self.started = start = time.perf_counter()
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.set_grad_enabled(False)
@@ -257,6 +272,8 @@ class Engine:
     # ------------------------------------------------------------------ setup
 
     def _setup(self, weights, use_triton, use_graphs):
+        if not hasattr(self, "started"):  # from_model, in the offline tests
+            self.started = time.perf_counter()
         self.w = weights
         self.state = None
         self.use_graphs = use_graphs and self.device.type == "cuda"
@@ -1045,20 +1062,38 @@ class Engine:
         self.w.ensure_rope(st.capacity)
         st.step = self._step_safe
 
+        planning = self.project is kgemm.project and batch <= FUSED_MAX_BATCH
         if self.device.type == "cuda":
-            self._calibrate(st)
-            if self.attn_triton:
+            # Everything from here is optional and is spent out of one budget.
+            # The order is by what is lost if it is skipped: the tiles, then
+            # the attention shape, then the calibration that only orders the
+            # shortlist the tuner was going to measure anyway.
+            spare = self._remaining() - RESERVE_S
+            if spare > 0.4 * TUNE_BUDGET_S:
+                self._calibrate(st)
+            spare = self._remaining() - RESERVE_S
+            if self.attn_triton and spare > 0:
                 self._guard(self._tune_attention, "attention tuning", st,
-                            time.perf_counter() + ATTN_TUNE_BUDGET_S)
-            if self.project is kgemm.project and batch <= FUSED_MAX_BATCH:
+                            time.perf_counter() + min(ATTN_TUNE_BUDGET_S,
+                                                      0.3 * spare))
+            spare = self._remaining() - RESERVE_S
+            if planning and spare > 0:
                 self._guard(self._tune_projections, "tile tuning", st,
-                            time.perf_counter() + TUNE_BUDGET_S)
-                if st.tiles:
-                    self._guard(self._adopt_fast_step, "fused step", st)
+                            time.perf_counter() + min(TUNE_BUDGET_S, spare))
+        if planning and len(st.tiles) < len(ROLES):
+            # Out of budget, or a role whose race raised.  The tile every
+            # engine since v1 has run needs no measurement to be safe, and a
+            # fused step on it still beats the cuBLAS one.
+            self._fill_incumbent_tiles(st)
+        if planning and st.tiles and self._remaining() > FUSED_CHECK_S:
+            self._guard(self._adopt_fast_step, "fused step", st)
         if self.use_graphs and new_tokens > 1:
+            # Never skipped for time: one capture is a few seconds and it is
+            # the largest single win in the engine.
             self._guard(self._capture_decode, "decode graph", st)
         if (self.use_graphs and self.qkv_post is kelem.qkv_post
-                and batch * prompt_len <= PREFILL_GRAPH_MAX_TOKENS):
+                and batch * prompt_len <= PREFILL_GRAPH_MAX_TOKENS
+                and self._remaining() > 0.5 * RESERVE_S):
             # The reference qkv_post reads the position on the host, so a
             # prefill running on it cannot be captured at all.
             self._guard(self._capture_prefill, "prefill graph", st)
@@ -1066,6 +1101,42 @@ class Engine:
         self.state = st
         self._report(st, time.perf_counter() - start)
         return st
+
+    def _remaining(self):
+        """Seconds left of the load-plus-warmup budget."""
+        return WARMUP_BUDGET_S - (time.perf_counter() - self.started)
+
+    def _fill_incumbent_tiles(self, st):
+        """Give every unplanned role the tile v1 through v12 all ran.
+
+        It divides every one of this checkpoint's dimensions, it leaves 160
+        partials for the two producing roles against a 256-row hand-off
+        buffer, and it needs no split-K -- so it is legal without being
+        checked, which is the point of having it.
+        """
+        for role in ROLES:
+            if role in st.tiles:
+                continue
+            cached = self.tile_cache.get((st.batch, role))
+            if cached is not None:
+                st.tiles[role] = cached
+                continue
+            n, k, _, glu, _ = self.w.role_dims(role)
+            incumbent = planner.Tile(st.block_m, 16, 256)
+            if n % incumbent.bn == 0 and k % incumbent.bk == 0:
+                st.tiles[role] = incumbent
+                continue
+            # Not this checkpoint, then.  Take the model's first choice
+            # unmeasured rather than launch a tile that does not divide.
+            picks = planner.candidates(
+                st.batch, n, k, glu, self.dev, limit=1,
+                allow_split=role != "lm", allow_fixup=self.fixup_ok,
+                max_parts=SSQ_PARTS if role in ("o", "down") else None,
+                partial_capacity=st.partial_capacity)
+            if picks:
+                st.tiles[role] = picks[0]
+        _log(f"tiles: {len(st.tiles)} roles planned, "
+             f"{self._remaining():.0f}s of budget left")
 
     def _guard(self, fn, label, *args):
         try:

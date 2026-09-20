@@ -171,6 +171,34 @@ def test_fused_step_matches_the_reference_step():
               f"B={batch}: the fused step disagrees with the reference step")
 
 
+def test_plan_survives_an_exhausted_budget():
+    """Load plus warmup share 300 seconds, and going over is ``timeout`` --
+    the run, not just the tuning.  So when the budget is gone the engine has
+    to fall back to a plan it can trust without measuring, and that plan has
+    to be legal and produce the same logits as the reference step."""
+    model = tiny_model(layers=2)
+    engine = Engine.from_model(copy.deepcopy(model), "cpu", use_triton=False,
+                               use_graphs=False)
+    batch, prompt_len, steps = 2, 10, 3
+    torch.manual_seed(21)
+    prompts = torch.randint(0, 512, (batch, prompt_len)).tolist()
+    engine_tokens(engine, prompts, steps)
+    st = engine.state
+    st.tiles.clear()
+    engine._fill_incumbent_tiles(st)
+    check(len(st.tiles) == 5, f"only {len(st.tiles)} of 5 roles were planned")
+    for role, tile in st.tiles.items():
+        n, k, _, _, _ = engine.w.role_dims(role)
+        check(n % tile.bn == 0 and k % tile.bk == 0,
+              f"fallback tile {tile} does not divide {role} (n={n} k={k})")
+        if role in ("o", "down"):
+            check(-(-n // tile.bn) <= 256,
+                  f"fallback tile {tile} needs more hand-off rows than there are")
+    check(engine._check_fast(st), "the fallback plan disagrees with the reference")
+    # The budget itself has to be a real clock, counted from __init__.
+    check(engine._remaining() < 255.0, "the budget did not start counting")
+
+
 def test_generator_contract():
     """``generate`` is a generator that yields exactly ``max_new_tokens``
     lists, and yields nothing at all for a non-positive count."""
