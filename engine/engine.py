@@ -95,8 +95,18 @@ MEGA_FORCE = False
 FUSED_MAX_BATCH = 128
 # Warmup seconds allowed for tuning the fused step's GEMM tiles, and for the
 # decode attention tile shape.
-TUNE_BUDGET_S = 90.0
-ATTN_TUNE_BUDGET_S = 25.0
+#
+# These are the binding constraint on the *whole run*, not just on the 300 s
+# load-plus-warmup budget: a run gets 15 minutes for all six workloads, each
+# of which is a fresh process paying its own checkpoint load and its own
+# warmup. Successful runs have taken 7m46s to 9m34s, and run 4bca974b was
+# terminated at 15 minutes after v18 added one more graph capture per
+# workload. Six times whatever is spent here lands on that limit, so the
+# budgets are small and the candidate list per role is short; the 3% margin
+# means extra candidates rarely change the choice anyway.
+TUNE_BUDGET_S = 30.0
+ATTN_TUNE_BUDGET_S = 8.0
+TUNE_MAX_CANDIDATES = 4
 # A later candidate has to win by this much to displace an earlier one. Runs
 # vary by ~1-2% on identical code, so picking the bare minimum of a set of
 # noisy measurements is how a tuner talks itself into a worse configuration;
@@ -328,14 +338,14 @@ class Engine:
     # bit-for-bit on nearly every element; anything else is a bug.
 
     @staticmethod
-    def _agree(fast, ref, min_exact=0.98):
+    def _agree(fast, ref, min_exact=0.98, tol=0.02):
         fast, ref = fast.float(), ref.float()
         if not torch.isfinite(fast).all():
             return False, "non-finite"
         exact = (fast == ref).float().mean().item()
         err = (fast - ref).abs().max().item()
         scale = ref.abs().max().item()
-        ok = exact >= min_exact and err <= 0.02 * scale + 1e-3
+        ok = exact >= min_exact and err <= tol * scale + 1e-3
         return ok, f"exact={exact:.4f} max_err={err:.3g}"
 
     def _randn(self, *shape, scale=1.0):
@@ -387,8 +397,11 @@ class Engine:
             attn = ops.DecodeAttention(batch, cap, self.nq, self.nkv, self.head_dim, self.device)
             fast = attn(q, kc, vc, pos)
             ref = ops.decode_attention_ref(q, kc, vc, pos, self.nq, self.nkv)
-            # Different (valid) summation order: compare with a tolerance only.
-            results.append(self._agree(fast, ref, min_exact=0.0))
+            # Different (valid) summation order, so a tolerance rather than
+            # equality -- but a tight one: 2% of the attention output is a
+            # large error to let through a gate whose whole job is to keep
+            # the engine inside a 2.0-logit budget.
+            results.append(self._agree(fast, ref, min_exact=0.0, tol=0.005))
         return all(ok for ok, _ in results), "; ".join(d for _, d in results)
 
     def _check_prefill_gqa(self):
@@ -400,7 +413,9 @@ class Engine:
         vc = self._randn(batch, self.nkv, cap, self.head_dim)
         fast = self._attend_prefill(q, kc, vc, batch, T, gqa=True)
         ref = self._attend_prefill(q, kc, vc, batch, T, gqa=False)
-        return self._agree(fast, ref, min_exact=0.9)
+        # Both are FlashAttention over the same numbers, so they should agree
+        # almost exactly; anything looser is not evidence that they do.
+        return self._agree(fast, ref, min_exact=0.9, tol=0.005)
 
     # ---------------------------------------------------------------- forward
 
@@ -525,7 +540,7 @@ class Engine:
         return {"qkv": self.layers[0].in_w, "gate_up": self.layers[0].post_w,
                 "lm": self.norm_w}.get(role)
 
-    def _tune_gemv(self, plan, role, deadline):
+    def _tune_gemv(self, plan, role, deadline, limit=None):
         """Time every candidate tile over all 36 layers' weights (so nothing
         sits in L2) inside a CUDA graph; return the fastest that runs."""
         n, k, norm, glu, res = plan.dims(role)
@@ -542,7 +557,8 @@ class Engine:
         # RES_OUT epilogue, which is exactly the producer roles.
         split_ok = role in plan.PRODUCERS and n == plan.hidden
         timings = []
-        for cfg in fused.candidates(m, split_ok):
+        cands = fused.candidates(m, split_ok)
+        for cfg in (cands[:limit] if limit else cands):
             if n % cfg.bn or k % (cfg.bk * cfg.split) or cfg.bn > n:
                 continue
             if timings and time.perf_counter() > deadline:
@@ -682,7 +698,13 @@ class Engine:
             max_d = max(max_d, diff.max().item())
             mean_d = max(mean_d, diff.mean().item())
             agree += (got.argmax(-1) == refs[t].argmax(-1)).sum().item()
-        ok = max_d <= 1.5 and mean_d <= 0.1
+        # Tight on purpose. Run ba9418a0 failed `incorrect_output` on a hidden
+        # workload while all three public shapes passed, on engine bytes that
+        # had already passed a previous run: so some prompt or shape crosses
+        # the judge's 2.0-logit margin occasionally. A step that disagrees
+        # with the reference step by more than a fraction of that budget is
+        # not worth its speed, and falling back costs a few percent.
+        ok = max_d <= 0.75 and mean_d <= 0.05
         return ok, f"max|dlogit|={max_d:.3f} mean={mean_d:.4f} argmax {agree}/{n_check * batch}"
 
     @staticmethod
@@ -720,7 +742,8 @@ class Engine:
         # the last ones; unused time carries forward.
         slice_s = TUNE_BUDGET_S / len(plan.ROLES)
         for i, role in enumerate(plan.ROLES):
-            plan.cfg[role] = self._tune_gemv(plan, role, start + slice_s * (i + 1))
+            plan.cfg[role] = self._tune_gemv(plan, role, start + slice_s * (i + 1),
+                                             limit=TUNE_MAX_CANDIDATES)
             if role == "down":
                 plan.parts_o = plan.hidden // plan.cfg["o"].bn
                 plan.parts_down = plan.hidden // plan.cfg["down"].bn

@@ -863,3 +863,44 @@ the usual 3% margin.
 If it does nothing, that is informative too: it would mean the activation
 re-reads are not just non-stalling but genuinely free, and the remaining
 ~1.46 ms is per-kernel ramp rather than anything about L2.
+
+## Two constraints discovered the hard way (runs ba9418a0, 4bca974b)
+
+**1. A hidden workload produced a wrong token.** Run `ba9418a0` failed
+`incorrect_output` - "the engine's tokens did not match native Qwen's greedy
+choice" - while all three public shapes came back `correct: true` with good
+numbers (p50 716.9 on public-2, the fast cluster). Its `engine/` bytes are
+identical to `3d806dab`, which passed. So: **flaky, hidden-only, on code that
+has passed before.** Something in the engine sits close enough to the judge's
+2.0-logit margin that an occasional prompt or shape crosses it.
+
+Twenty-odd runs had all been `correct: true`, so the rate is low - but it is
+not zero, and it had been invisible because nothing else fails loudly.
+
+Response, none of it speed work: the fused-step acceptance threshold drops
+from 1.5 to 0.75 max logit difference (and mean 0.1 to 0.05) against the
+reference step; the decode-attention and prefill-GQA load checks drop from a
+2% relative tolerance to 0.5%. Typical observed deviations are 0.1-0.3, so
+a healthy engine still passes; a marginal one now falls back to the v1 path
+instead of shipping, at a cost of a few percent.
+
+**2. A run gets 15 minutes for all six workloads.** Run `4bca974b` (v18) was
+terminated: "the run exceeded the 15-minute time limit", attempt 2 of 3.
+Successful runs take 7m46s to 9m34s. Every workload is a fresh process paying
+its own checkpoint load *and* its own warmup, so anything spent in warmup is
+multiplied by six against that limit - and v18 added one more whole-step
+graph capture per workload.
+
+This reframes the warmup budget entirely. It was sized against the 300 s
+load-plus-warmup gate, which is per workload and was never the binding one:
+
+- `TUNE_BUDGET_S` 90 -> 30, `ATTN_TUNE_BUDGET_S` 25 -> 8, and at most 4
+  candidates per role. With the 3% margin, extra candidates rarely change
+  the choice anyway.
+- That frees roughly 5 minutes per run, which is what makes v18's cache-policy
+  race affordable at all.
+
+**Both of these had been quietly shaping the run log before they were
+identified**: 4bca974b and ac007ced were read as "superseded", and the v14
+session's "warmup change" (run 42b2ac2b, 864.45) was very likely fighting the
+same limit.
