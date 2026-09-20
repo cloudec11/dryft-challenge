@@ -14,7 +14,8 @@ workloads. Fill in the numbers from the run page.
 | 6+7 | 6505b80 | v6 single-split attention + v7 split-8/argmax + cold-KV tuner fix | 888.2 | yes | run b54796c8; B16 best yet (715.8 ms), B1/B4 -2% |
 | 8 | cd5ef7c | v8: noise-robust tuner decisions (3% margin, min-of-rounds) | **902.9** | yes | run 84daa14e, **best so far, #22**; all three public shapes improved together |
 | 9 | 31212d0 | v9: split-K for every projection but the LM head | 883.6 | yes | run 881e52fa; ~2% down everywhere incl. untouched TTFT -> slower machine instance |
-| 10 | _tbd_ | v10: widened exact speculative verification (n-gram drafts) | | | |
+| 10 | _tbd_ | v10: widened exact speculative verification (n-gram drafts) | 900.9 | yes | Statistically flat versus v8's 902.9; inspect spec logs before changing it again. |
+| 11 | _tbd_ | v11: 3-gram → 2-gram backoff proposer, exact verification | | | Isolates proposal quality while restoring the known-good K=3 verifier. |
 
 ## v1 design (branch `fast-engine`)
 
@@ -403,3 +404,14 @@ Known risk: **the sample-spread gate.** Acceptance varies by prompt, so
 sample times vary; over 25% spread fails the workload. A failed run keeps
 the best score, so the cost of being wrong is one run and the failure code
 tells us which way.
+
+### v10 result
+
+Score: **900.9 tok/s**. This is 0.22% below v8's 902.9 and therefore inside
+the observed 1–2% between-run timing noise. It is not enough evidence to
+conclude that the wider verifier regressed. The current platform has retired
+public runs and hides engine stderr for ranked attempts, so `spec iteration`
+and `spec measured` are not available as feedback. Compare paired official
+runs one change at a time, using the result page's visible public-workload
+TTFT, TPOT, throughput, and spread where available; the six hidden workloads
+remain the ranking signal.

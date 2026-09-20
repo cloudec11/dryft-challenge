@@ -72,21 +72,20 @@ PREFILL_GRAPH_MAX_TOKENS = 16384
 # Tiles that need too much shared memory at a given BLOCK_M just fail to
 # compile during tuning and are skipped.
 FUSED_MAX_BATCH = 128
-# Speculative decoding deliberately has a larger row budget than ordinary
-# decode.  Verification amortises one full weight stream over B * (K + 1)
-# rows, so its useful operating point is wider than the B-row decode kernel.
-# If a wide specialization cannot compile or does not repay its cost on the
-# workload's warmup prompt, the existing exact gate leaves speculation off.
-SPEC_MAX_ROWS = 256
-# A three-token draft was too short to expose the only super-linear lever in
-# this benchmark: several exact output tokens from one target-model pass.
-# Seven is still small enough that verification fits the static cache and the
-# fused plan at the public shapes, while the warmup net-gain test prevents it
-# from hurting prompts with no useful repetition.
-SPEC_K = 7
-# N-gram order for the lookup, and the net speedup (measured on the judge's
-# own warmup prompt) below which speculation is switched off for the samples.
-SPEC_NGRAM = 2
+# Keep the verifier at the known-good four rows per sequence. The widened
+# seven-token verifier scored flat, while a short block makes an n-gram's
+# entire continuation more likely to be usable. This revision changes draft
+# quality, not target-side verifier cost.
+SPEC_MAX_ROWS = 128
+SPEC_K = 3
+# The proposer first looks for a longer exact history match, then backs off to
+# a 2-gram. A longer match is materially more predictive while the fallback
+# preserves coverage on ordinary prose. This only chooses draft tokens: the
+# full BF16 target still verifies every emitted token.
+SPEC_NGRAM = 3
+SPEC_BACKOFF_NGRAM = 2
+# Net speedup (measured on the judge's own warmup prompt) below which
+# speculation is switched off for the samples.
 SPEC_MIN_NET_GAIN = 1.05
 SPEC_TUNE_BUDGET_S = 25.0
 # Warmup seconds allowed for tuning the fused step's GEMM tiles, and for the
@@ -202,11 +201,12 @@ class _SpecPlan:
     verification costs ~1.1x a single-token step instead of the ~1.4x a
     prefill-shaped path would."""
 
-    def __init__(self, engine, st, k, ngram):
+    def __init__(self, engine, st, k, ngram, backoff_ngram):
         dev = engine.device
         batch = st.batch
         self.k = k
         self.ngram = ngram
+        self.backoff_ngram = backoff_ngram
         self.t = k + 1
         self.rows = batch * self.t
         self.fused = _FusedPlan(engine, self.rows)
@@ -791,7 +791,10 @@ class Engine:
         rows, bm, c, eps, hid = sp.rows, f.bm, f.cfg, self.eps, f.hidden
         pb, pp = f.parts_block, fused.SSQ_PARTS
         a_buf, b_buf = f.ssq_a, f.ssq_b
-        spec.ngram_draft(sp.hist, sp.lens, sp.ids, sp.draft, sp.ngram, sp.k, sp.t)
+        spec.ngram_draft(
+            sp.hist, sp.lens, sp.ids, sp.draft,
+            sp.ngram, sp.backoff_ngram, sp.k, sp.t,
+        )
         fused.embed_ssq(sp.ids, self.embed_w, f.h, b_buf)
         parts = 1
         for i, layer in enumerate(self.layers):
@@ -934,7 +937,7 @@ class Engine:
 
     def _setup_spec(self, st, prompt_len, new_tokens, spec_k=SPEC_K):
         start = time.perf_counter()
-        sp = _SpecPlan(self, st, spec_k, SPEC_NGRAM)
+        sp = _SpecPlan(self, st, spec_k, SPEC_NGRAM, SPEC_BACKOFF_NGRAM)
         sp.stop_len = prompt_len + new_tokens - 1
         st.spec = sp
         f = sp.fused

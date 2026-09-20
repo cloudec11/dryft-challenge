@@ -12,8 +12,8 @@ technique here that changes the token count per step without touching the
 
 Per iteration, for every sequence b with cache length L[b]:
 
-* draft: take the last NGRAM tokens of the sequence's own history, find the
-  most recent earlier occurrence, and copy the K tokens that followed it.
+* draft: prefer a recent 3-gram with a complete continuation; if none is
+  available, fall back to a 2-gram and copy the K following tokens.
 * verify: run the fused decode step over T = K+1 rows per sequence, feeding
   [current token, draft...] at positions L[b] .. L[b]+K, and take the argmax
   at each row. Row t's argmax is the true greedy token at position L[b]+t
@@ -36,8 +36,8 @@ import triton.language as tl
 @triton.jit
 def _ngram_draft_kernel(
     hist_ptr, lens_ptr, ids_ptr, draft_ptr, cap,
-    NGRAM: tl.constexpr, K: tl.constexpr, T: tl.constexpr, BLOCK: tl.constexpr,
-    CAP: tl.constexpr,
+    PRIMARY: tl.constexpr, BACKOFF: tl.constexpr,
+    K: tl.constexpr, T: tl.constexpr, BLOCK: tl.constexpr, CAP: tl.constexpr,
 ):
     # History of sequence b is hist[b, 0 .. L] inclusive: L = lens[b] slots
     # are in the KV cache and hist[b, L] is the token not yet fed (the one
@@ -47,11 +47,14 @@ def _ngram_draft_kernel(
     base = b.to(tl.int64) * cap
     tl.store(ids_ptr + b * T, tl.load(hist_ptr + base + L))  # row 0: current token
 
-    # Most recent j < L - NGRAM + 1 with hist[j .. j+NGRAM-1] == the last
-    # NGRAM tokens. Scanning forward and keeping the max index gives the most
-    # recent match, which is the better predictor in practice.
-    best = -1
-    limit = L - NGRAM + 1  # j must leave a following token at j+NGRAM <= L
+    # Prefer the most recent PRIMARY-gram match with a complete K-token
+    # continuation; fall back to BACKOFF only when no such long match exists.
+    # Requiring the whole continuation avoids manufacturing token 0 in the
+    # tail of a near-end match, which made longer drafts self-defeating.
+    best_primary = -1
+    best_backoff = -1
+    primary_limit = L - PRIMARY - K + 2
+    backoff_limit = L - BACKOFF - K + 2
     # ``L`` varies between sequences after the first speculative iteration.
     # Keep the loop bound a compile-time capacity instead of using a runtime
     # Python-range endpoint: Triton 3.1 can then compile one stable graph
@@ -59,32 +62,49 @@ def _ngram_draft_kernel(
     # cache slots and positions beyond this sequence's valid history.
     for j0 in range(0, CAP, BLOCK):
         offs = j0 + tl.arange(0, BLOCK)
-        ok = offs < limit
-        for i in tl.static_range(NGRAM):
+        primary_ok = offs < primary_limit
+        for i in tl.static_range(PRIMARY):
             # Clamped: a sequence shorter than the n-gram would index before
             # the row, and an unmasked out-of-bounds read takes the context
             # down rather than failing softly.
-            pat_at = tl.maximum(L - NGRAM + 1 + i, 0)
+            pat_at = tl.maximum(L - PRIMARY + 1 + i, 0)
             pat = tl.load(hist_ptr + base + pat_at)
-            tok = tl.load(hist_ptr + base + offs + i, mask=ok, other=-1)
-            ok = ok & (tok == pat)
-        best = tl.maximum(best, tl.max(tl.where(ok, offs, -1), axis=0))
+            tok = tl.load(hist_ptr + base + offs + i, mask=primary_ok, other=-1)
+            primary_ok = primary_ok & (tok == pat)
+        best_primary = tl.maximum(
+            best_primary, tl.max(tl.where(primary_ok, offs, -1), axis=0)
+        )
+
+        backoff_ok = offs < backoff_limit
+        for i in tl.static_range(BACKOFF):
+            pat_at = tl.maximum(L - BACKOFF + 1 + i, 0)
+            pat = tl.load(hist_ptr + base + pat_at)
+            tok = tl.load(hist_ptr + base + offs + i, mask=backoff_ok, other=-1)
+            backoff_ok = backoff_ok & (tok == pat)
+        best_backoff = tl.maximum(
+            best_backoff, tl.max(tl.where(backoff_ok, offs, -1), axis=0)
+        )
+
+    has_primary = best_primary >= 0
+    best = tl.where(has_primary, best_primary, best_backoff)
+    ngram = tl.where(has_primary, PRIMARY, BACKOFF)
 
     for t in tl.static_range(K):
-        idx = best + NGRAM + t
-        ok = (best >= 0) & (idx <= L)
+        idx = best + ngram + t
+        ok = best >= 0
         tok = tl.load(hist_ptr + base + idx, mask=ok, other=0)
         tl.store(draft_ptr + b * K + t, tok)
         tl.store(ids_ptr + b * T + 1 + t, tok)
 
 
-def ngram_draft(hist, lens, ids, draft, ngram, k, t):
-    """Fill ``ids`` ``[B*T]`` with [current, drafts...] per sequence and
-    ``draft`` ``[B, K]`` with the drafts alone."""
+def ngram_draft(hist, lens, ids, draft, primary, backoff, k, t):
+    """Fill ``ids`` with a full-continuation primary n-gram draft, falling
+    back to a shorter n-gram only when the primary has no usable match."""
     batch, cap = hist.shape
     _ngram_draft_kernel[(batch,)](
         hist, lens, ids, draft, cap,
-        NGRAM=ngram, K=k, T=t, BLOCK=1024, CAP=cap, num_warps=4,
+        PRIMARY=primary, BACKOFF=backoff, K=k, T=t, BLOCK=1024, CAP=cap,
+        num_warps=4,
     )
 
 
