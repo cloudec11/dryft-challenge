@@ -550,14 +550,14 @@ class Engine:
         x = self._randn(m, k)
         out = torch.empty((m, n), dtype=self.dtype, device=self.device)
         res_buf = self._randn(m, n) if res else None
-        # A plausible rstd: the live partials sum to about K, as they would
-        # for a unit-variance row.
-        n_parts = plan.n_parts_in(role)
-        ssq_in = torch.full((kproj.SSQ_PARTS, bm), float(k) / max(n_parts, 1),
+        # A plausible rstd: the partials sum to roughly K, as they would for a
+        # unit-variance row.
+        ssq_in = torch.full((kproj.SSQ_PARTS, bm), float(k) / kproj.SSQ_PARTS,
                             dtype=torch.float32, device=self.device)
         ssq_out = torch.zeros_like(ssq_in)
         norm_w = w.role_norm(role) if norm else None
         weights = w.role_weights(role)
+        n_parts = plan.n_parts_in(role)
         cands = kproj.candidates(m, n, k, glu, self.sm_count, limit=CAND_LIMIT,
                                  prefer_wide=res)
 
@@ -636,7 +636,7 @@ class Engine:
                             attn.fused(qkv, layer.q_norm, layer.k_norm, w.cos, w.sin,
                                        pos, ki, vi, w.eps, out=out)
                         else:
-                            attn.plain(q, ki, vi, pos, out=out)
+                            attn.plain(q, ki, vi, pos)
 
                 run()
                 torch.cuda.synchronize()
@@ -854,8 +854,8 @@ class Engine:
         return st
 
     def _report(self, st, setup_s):
-        """One line per shape, with the number that localises the remaining
-        gap: what fraction of HBM the step actually achieves."""
+        """One line per shape, with the only number that localises the gap:
+        what fraction of HBM the step actually achieves."""
         w = self.w
         kv_bytes = 2 * st.batch * w.nkv * st.capacity * w.head_dim * 2 * w.n_layers
         note = ""

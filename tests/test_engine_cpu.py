@@ -71,8 +71,9 @@ def run(dtype, use_triton, shapes):
     ref = copy.deepcopy(model)
     eng = Engine.from_model(model, "cpu", use_triton=use_triton, use_graphs=False)
     if os.environ.get("FORCE_TRITON") == "1":
-        from kernels import ops
-        eng.k_add_norm, eng.k_qkv_post, eng.k_silu_mul = ops.add_rms_norm, ops.qkv_post, ops.silu_mul
+        from kernels import misc
+        eng.k_add_norm, eng.k_qkv_post = misc.add_rms_norm, misc.qkv_post
+        eng.k_silu_mul, eng.k_embed = misc.silu_mul, misc.embed
         eng.use_triton_attn = True
     ok = True
     for (B, S, N) in shapes:
