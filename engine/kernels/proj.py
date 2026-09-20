@@ -367,8 +367,11 @@ def candidates(m, n, k, glu, sm_count, limit=11, prefer_wide=False):
 
     head = []
     bn, bk, st, wp = _SAFE
-    if m > 1 and n % bn == 0 and k % bk == 0:
-        safe = Config(bn, bk, stages=st, warps=wp)
+    safe = Config(bn, bk, stages=st, warps=wp)
+    # The incumbent still has to be launchable: its x tile is BLOCK_M wide,
+    # so at a large batch it runs out of shared memory like any other.
+    if (m > 1 and n % bn == 0 and k % bk == 0
+            and smem_bytes(safe, block_m, glu) <= SMEM_MAX_BLOCK):
         _score(safe, block_m, glu, n, k, sm_count, prefer_wide)
         head.append(safe)
     for cfg in out:
@@ -413,6 +416,9 @@ def project(x, w, y, m, n, k, cfg, block_m, ssq_in, ssq_out, eps,
         raise ValueError(f"{n_parts} partials do not fit in {parts_block}")
 
     if cfg.vec:
+        # The single-row kernel has no row dimension at all, so a batch that
+        # reached it would silently compute row 0 and leave the rest stale.
+        assert m == 1, "the vector kernel is a batch-1 specialisation"
         _proj_vec_kernel[(n // cfg.bn,)](
             x, w, dst, dst, ssq_in, ssq_out, nw,
             n, k, n_parts, eps,
