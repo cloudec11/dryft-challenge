@@ -104,9 +104,13 @@ FUSED_MAX_BATCH = 128
 # workload. Six times whatever is spent here lands on that limit, so the
 # budgets are small and the candidate list per role is short; the 3% margin
 # means extra candidates rarely change the choice anyway.
-TUNE_BUDGET_S = 30.0
+TUNE_BUDGET_S = 50.0
 ATTN_TUNE_BUDGET_S = 8.0
-TUNE_MAX_CANDIDATES = 4
+# At batch 1 the candidate list is four single-row configs followed by three
+# tile configs, so a cap of 4 hid the tile configs completely -- which is what
+# cost 10% at batch 1 in v19/v20 while batch 4 and 16, whose first candidate
+# is already their usual choice, did not move. 6 reaches both kinds.
+TUNE_MAX_CANDIDATES = 6
 # A later candidate has to win by this much to displace an earlier one. Runs
 # vary by ~1-2% on identical code, so picking the bare minimum of a set of
 # noisy measurements is how a tuner talks itself into a worse configuration;
@@ -677,13 +681,20 @@ class Engine:
         if ok:
             st.attn = attn
 
-    def _check_fused(self, st, prompt_len, new_tokens, step_fn=None):
+    def _check_fused(self, st, prompt_len, new_tokens, step_fn=None, low_entropy=False):
         """Logits of the fused step vs the v1 step on the same synthetic
         prompt and the same forced tokens, over a few consecutive steps."""
         batch = st.batch
         n_check = min(3, new_tokens)
         gen = torch.Generator(device="cpu").manual_seed(4321)
         prompt = torch.randint(100, 100000, (batch, prompt_len), generator=gen).to(self.device)
+        if low_entropy:
+            # A few tokens repeated: peaked attention and larger hidden-state
+            # magnitudes than uniform random ids, which is where a marginal
+            # configuration shows itself. Two hidden workloads have failed
+            # incorrect_output while every public shape passed, so the check
+            # prompt being unrepresentative is a live suspect.
+            prompt = prompt[:, :8].repeat(1, -(-prompt_len // 8))[:, :prompt_len].contiguous()
         toks = torch.randint(100, 100000, (n_check, batch), generator=gen).to(self.device)
         self._prefill(st, prompt)
         step_fn = step_fn or self._decode_step_fused
@@ -757,6 +768,11 @@ class Engine:
                 plan.parts_block = max(2, 1 << (most - 1).bit_length())
         ok, detail = self._check_fused(st, prompt_len, new_tokens)
         _log(f"fused step vs v1: {detail} -> {'ok' if ok else 'REJECTED'}")
+        if ok:
+            ok2, detail2 = self._check_fused(st, prompt_len, new_tokens, low_entropy=True)
+            _log(f"fused step vs v1, repeated prompt: {detail2} -> "
+                 f"{'ok' if ok2 else 'REJECTED'}")
+            ok = ok and ok2
         if not ok:
             st.fused = None
             return

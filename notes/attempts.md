@@ -938,3 +938,41 @@ and prefill GQA flash against expanded flash at 0.5%.
 Lesson worth keeping: **a tolerance is only as meaningful as the pair being
 compared.** Tightening a cross-formulation check does not buy correctness, it
 buys a fallback.
+
+## Run 22 (official fc9b214e, v20) - FAILED incorrect_output, and B1 stayed slow
+
+| | score | B1 TPOT | B4 TPOT | B16 TPOT | result |
+|---|---:|---:|---:|---:|---|
+| v17 `7fb8b308` | 882.98 | 3.958 | 4.925 | 4.913 | succeeded |
+| v19 `0b04c099` | 874.79 | 4.352 | 4.906 | 4.904 | succeeded |
+| v20 `fc9b214e` | - | 4.346 | 4.917 | 4.913 | **failed, incorrect_output** |
+
+Two things learned, and both of my explanations were wrong.
+
+**The attention tolerance was not why batch 1 got slow.** v20 put it back at
+2% and B1 TPOT stayed at 4.346. So I checked the actual kernels offline
+instead of theorising: both projection kernels, single-row and tiled, are
+**bit-exact** against a torch reference through the simulator, including with
+a 40x outlier channel of the kind Qwen3 hidden states carry. The GEMVs are
+not deviating from anything.
+
+What is left is much more ordinary: **v19's candidate cap starved batch 1.**
+`candidates(1)` is four single-row configs followed by three tile configs, so
+`limit=4` hid the tile configs entirely - while batch 4 and 16, whose first
+candidate is already their usual pick, did not move at all. That asymmetry is
+the fingerprint. Cap goes to 6 and the budget to 50 s (still ~40 s per
+workload under v17, and run duration was 6m38s against the 15-minute limit,
+so there is room).
+
+**The correctness failure is now twice, not once** (`ba9418a0`, `fc9b214e`),
+both with every public shape `correct: true`. It is a hidden shape, it is
+not deterministic, and the public shapes cannot see it. The one thing under
+our control is that the load-time check uses a synthetic uniform-random
+prompt, which may simply be easier than a corpus one: so `_check_fused` now
+also runs a **repeated-token prompt**, which gives peaked attention and
+larger hidden-state magnitudes, and both must pass at 0.75 logits.
+
+That is a guard, not a diagnosis. Being honest about the state of it: with
+no engine stdout and correctness reported only as one flag per run, a
+non-deterministic wrong token on an unseen shape is close to the worst case
+this feedback channel can describe.
